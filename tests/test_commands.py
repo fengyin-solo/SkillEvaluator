@@ -1564,6 +1564,7 @@ def test_catalog_child_argv_forwards_every_validate_option() -> None:
         "content_type": "the child re-detects the type of the single skill it is handed",
         "workers": "forwarding it would make each child fan out again",
         "output_dir": "each child is given its own per-skill output directory",
+        "checkpoint_dir": "the catalog worker owns per-skill checkpoint records, not the child invocation",
     }
     source = inspect.getsource(_catalog_child_argv_from_ctx)
 

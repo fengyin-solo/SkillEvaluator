@@ -1196,7 +1196,7 @@ def _catalog_child_argv_from_ctx(
     return argv
 
 
-def _run_catalog_skill_worker(job: dict[str, Any]) -> tuple[str, bool, str, str | None]:
+def _run_catalog_skill_worker(job: dict[str, Any]) -> tuple[str, bool, str, str | None, str | None]:
     """Run one catalog skill validation in a child process."""
     import os
 
@@ -1210,15 +1210,16 @@ def _run_catalog_skill_worker(job: dict[str, Any]) -> tuple[str, bool, str, str 
     result = CliRunner().invoke(cli, job["argv"])
     json_report_name = _consume_validate_json_report()
     if result.exit_code == 0:
-        return skill_name, True, "", json_report_name
+        checkpoint_error = _worker_write_checkpoint(job, True, json_report_name)
+        return skill_name, True, "", json_report_name, checkpoint_error
     exc = result.exception
     if isinstance(exc, SystemExit):
-        return skill_name, False, "validation failed", json_report_name
+        return skill_name, False, "validation failed", json_report_name, None
     if exc is not None:
         if isinstance(exc, click.ClickException):
-            return skill_name, False, str(getattr(exc, "message", exc)), json_report_name
-        return skill_name, False, f"unexpected error: {exc}", json_report_name
-    return skill_name, False, "validation failed", json_report_name
+            return skill_name, False, str(getattr(exc, "message", exc)), json_report_name, None
+        return skill_name, False, f"unexpected error: {exc}", json_report_name, None
+    return skill_name, False, "validation failed", json_report_name, None
 
 
 def _catalog_skill_entry(
@@ -1298,6 +1299,200 @@ def _write_catalog_summary(output_dir: Path, skills: list[dict[str, object]]) ->
     return output_path
 
 
+def _prepare_catalog_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    resolved_target: Path,
+    skill_dirs: list[Path],
+    content_type: str,
+    checks: str | None,
+    policy: object,
+    profile_name: str | None,
+    policy_path: Path | None,
+    quality_config: Path | None,
+    report_formats: tuple[str, ...],
+    verbose: bool,
+    include_skills: tuple[Path, ...],
+    options: dict[str, Any],
+) -> tuple[object, dict[str, Any]]:
+    """Validate the checkpoint directory and build the run-global plan.
+
+    Fails closed (before any skill is scanned) when the directory is a link,
+    is nested inside one of the skills being validated, or cannot be created
+    or written.
+    """
+    from skillevaluator.validation_checkpoint import (
+        CheckpointError,
+        CheckpointStore,
+        build_catalog_plan,
+    )
+
+    for skill_dir in skill_dirs:
+        try:
+            if checkpoint_dir.resolve(strict=False) == skill_dir.resolve(strict=False) or _path_is_within(
+                checkpoint_dir, skill_dir
+            ):
+                raise click.ClickException(
+                    "--checkpoint-dir must not be inside a skill being validated; "
+                    f"choose a path outside the catalog (got {checkpoint_dir} inside {skill_dir})"
+                )
+        except click.ClickException:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise click.ClickException(f"Cannot resolve --checkpoint-dir {checkpoint_dir}: {exc}") from exc
+
+    base_plan = build_catalog_plan(
+        catalog_root=resolved_target,
+        content_type=content_type,
+        checks_raw=checks,
+        check_lineup=enabled_check_lineup(checks),
+        policy_digest=getattr(policy, "digest", None),
+        profile_name=profile_name,
+        policy_path=policy_path,
+        quality_config=quality_config,
+        options=options,
+        report_formats=report_formats,
+        verbose=verbose,
+        include_skills=include_skills,
+    )
+    try:
+        store = CheckpointStore(checkpoint_dir, resolved_target)
+    except CheckpointError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return store, base_plan
+
+
+def _checkpoint_scan(store: object) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Load current-target records, announcing foreign/corrupt files."""
+    from skillevaluator.validation_checkpoint import CheckpointError
+
+    try:
+        records, warnings, invalid = store.scan()
+    except CheckpointError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for warning in warnings:
+        click.echo(f"Warning: checkpoint: {warning}", err=True)
+    return records, invalid
+
+
+def _checkpoint_classify(
+    store: object,
+    base_plan: dict[str, Any],
+    records: dict[str, dict[str, Any]],
+    invalid: dict[str, str],
+    skill_dir: Path,
+    skill_name: str,
+) -> tuple[object, dict[str, Any], str]:
+    """Fingerprint one skill's content and decide reuse vs. re-execution."""
+    from skillevaluator.validation_checkpoint import (
+        CheckpointError,
+        plan_fingerprint,
+        skill_content_digest,
+        skill_plan,
+    )
+
+    try:
+        content_digest = skill_content_digest(skill_dir)
+        plan = skill_plan(base_plan, skill_relpath=skill_name, content_digest=content_digest)
+        fingerprint = plan_fingerprint(plan)
+        decision = store.classify(skill_name, plan, fingerprint, records, invalid)
+    except CheckpointError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return decision, plan, fingerprint
+
+
+def _checkpoint_restore(store: object, record: dict[str, Any], skill_output: Path) -> str | None:
+    """Recreate the stored per-skill JSON report for summary binding."""
+    from skillevaluator.validation_checkpoint import CheckpointError
+
+    try:
+        return store.restore_json_report(record, skill_output)
+    except CheckpointError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _checkpoint_persist(
+    store: object,
+    *,
+    skill_name: str,
+    plan: dict[str, Any],
+    fingerprint: str,
+    skill_output: Path,
+    json_report_name: str | None,
+) -> None:
+    """Cache one complete successful skill result (and its JSON payload)."""
+    from skillevaluator.validation_checkpoint import CheckpointError, is_reusable_success
+
+    payload: dict[str, Any] | None = None
+    if json_report_name is not None:
+        report_path = skill_output / json_report_name
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            click.echo(f"Warning: checkpoint: cannot read JSON report for {skill_name} ({exc}); not cached", err=True)
+            return
+    if not is_reusable_success(True, payload):
+        click.echo(
+            f"Warning: checkpoint: {skill_name} reported failed or incomplete scans; not cached, it will rerun",
+            err=True,
+        )
+        return
+    try:
+        store.write_success(
+            skill_relpath=skill_name,
+            plan=plan,
+            fingerprint=fingerprint,
+            json_report_name=json_report_name,
+            json_payload=payload,
+        )
+    except CheckpointError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _worker_write_checkpoint(job: dict[str, Any], passed: bool, json_report_name: str | None) -> str | None:
+    """Persist a parallel worker's successful result; return an error string."""
+    checkpoint_dir = job.get("checkpoint_dir")
+    if not checkpoint_dir or not passed:
+        return None
+    try:
+        from skillevaluator.validation_checkpoint import CheckpointStore, is_reusable_success
+
+        payload: dict[str, Any] | None = None
+        if json_report_name:
+            report_path = Path(str(job["output_dir"])) / json_report_name
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        if not is_reusable_success(True, payload):
+            return None
+        store = CheckpointStore(Path(str(checkpoint_dir)), Path(str(job["catalog_root"])), prepare=False)
+        store.write_success(
+            skill_relpath=str(job["skill_relpath"]),
+            plan=job["checkpoint_plan"],
+            fingerprint=str(job["checkpoint_fingerprint"]),
+            json_report_name=json_report_name,
+            json_payload=payload,
+        )
+    except Exception as exc:  # surfaced by the parent as a fail-closed catalog error
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _print_checkpoint_reuse(index: int, total: int, skill_name: str) -> None:
+    console.print(
+        f"checkpoint reuse: skill {index}/{total} · {strip_terminal_controls(skill_name)}",
+        style="dim",
+        markup=False,
+        highlight=False,
+    )
+
+
+def _print_checkpoint_counts(counts: dict[str, int]) -> None:
+    console.print(
+        f"Checkpoint resume: {counts['reuse']} reused, {counts['stale']} re-executed, "
+        f"{counts['new']} newly executed",
+        style="dim",
+    )
+
+
 def _validate_catalog(
     ctx: click.Context,
     *,
@@ -1306,6 +1501,7 @@ def _validate_catalog(
     output_dir: Path,
     workers: int = 1,
     discovery_problems: dict[Path, str] | None = None,
+    checkpoint: tuple[object, dict[str, Any]] | None = None,
 ) -> None:
     """Run the full validate pipeline once per skill in the catalog.
 
@@ -1329,6 +1525,7 @@ def _validate_catalog(
             output_dir=output_dir,
             workers=workers,
             discovery_problems=discovery_problems,
+            checkpoint=checkpoint,
         )
         return
 
@@ -1337,6 +1534,15 @@ def _validate_catalog(
     previous_catalog_root = ctx.meta.get(meta_key)
     ctx.meta[meta_key] = output_dir
     skill_reports: dict[str, str | None] = {}
+    cp_store: object | None = None
+    cp_base_plan: dict[str, Any] | None = None
+    if checkpoint is not None:
+        cp_store, cp_base_plan = checkpoint
+    cp_records: dict[str, dict[str, Any]] = {}
+    cp_invalid: dict[str, str] = {}
+    if cp_store is not None:
+        cp_records, cp_invalid = _checkpoint_scan(cp_store)
+    cp_counts = {"new": 0, "reuse": 0, "stale": 0}
     try:
         for index, skill_dir in enumerate(skill_dirs, start=1):
             skill_name = skill_dir.relative_to(resolved_target).as_posix()
@@ -1344,6 +1550,27 @@ def _validate_catalog(
             if skill_dir in discovery_problems:
                 continue
             skill_output = output_dir / skill_name
+
+            cp_decision = None
+            cp_plan: dict[str, Any] | None = None
+            cp_fingerprint = ""
+            if cp_store is not None and cp_base_plan is not None:
+                cp_decision, cp_plan, cp_fingerprint = _checkpoint_classify(
+                    cp_store, cp_base_plan, cp_records, cp_invalid, skill_dir, skill_name
+                )
+                if cp_decision.kind == "reuse":
+                    cp_counts["reuse"] += 1
+                    _print_checkpoint_reuse(index, len(skill_dirs), skill_name)
+                    skill_reports[skill_name] = _checkpoint_restore(cp_store, cp_decision.record, skill_output)
+                    continue
+                cp_counts[cp_decision.kind] += 1
+                if cp_decision.kind == "stale":
+                    click.echo(
+                        f"Warning: checkpoint for {skill_name} is unusable "
+                        f"({cp_decision.reason}); re-executing.",
+                        err=True,
+                    )
+
             overrides = {
                 **ctx.params,
                 "target_path": skill_dir,
@@ -1352,15 +1579,27 @@ def _validate_catalog(
                 "results_dir": _catalog_results_dir(ctx, skill_dir, resolved_target),
             }
             reason = ""
+            succeeded = False
             try:
                 ctx.invoke(validate, **overrides)
+                succeeded = True
             except click.ClickException as exc:
                 reason = str(getattr(exc, "message", exc))
                 failures.append((skill_name, reason))
             except Exception as exc:  # unexpected: keep the catalog running, report it on the scoreboard
                 reason = f"unexpected error: {exc}"
                 failures.append((skill_name, reason))
-            skill_reports[skill_name] = _consume_validate_json_report()
+            json_report_name = _consume_validate_json_report()
+            skill_reports[skill_name] = json_report_name
+            if succeeded and cp_store is not None and cp_plan is not None:
+                _checkpoint_persist(
+                    cp_store,
+                    skill_name=skill_name,
+                    plan=cp_plan,
+                    fingerprint=cp_fingerprint,
+                    skill_output=skill_output,
+                    json_report_name=json_report_name,
+                )
     finally:
         if previous_catalog_root is None:
             ctx.meta.pop(meta_key, None)
@@ -1379,6 +1618,8 @@ def _validate_catalog(
     ]
     _write_catalog_summary(output_dir, skill_entries)
     _print_catalog_summary(len(skill_dirs), failures, output_dir)
+    if cp_store is not None:
+        _print_checkpoint_counts(cp_counts)
     if failures:
         raise click.ClickException(
             f"{len(failures)}/{len(skill_dirs)} skills failed validation: "
@@ -1394,6 +1635,7 @@ def _validate_catalog_parallel(
     output_dir: Path,
     workers: int,
     discovery_problems: dict[Path, str] | None = None,
+    checkpoint: tuple[object, dict[str, Any]] | None = None,
 ) -> None:
     """Validate catalog skills concurrently in isolated child processes."""
     from skillevaluator.reporting.console_ui import make_view_console
@@ -1404,32 +1646,83 @@ def _validate_catalog_parallel(
         _print_catalog_summary(0, [], output_dir)
         return
 
-    workdir = str(Path.cwd())
-    make_view_console().print(
-        f"[dim]Validating {len(skill_dirs)} skills with {workers} worker"
-        f"{'s' if workers != 1 else ''} (parallel catalog mode; per-skill pipeline view disabled)[/dim]"
-    )
-
-    jobs = [
-        {
-            "skill_name": skill_name,
-            "argv": _catalog_child_argv_from_ctx(ctx, skill_dir, output_dir / skill_name, catalog_root=catalog_root),
-            "cwd": workdir,
-            "output_dir": str(output_dir / skill_name),
-        }
-        for skill_dir in skill_dirs
-        if skill_dir not in discovery_problems
-        for skill_name in [skill_dir.relative_to(catalog_root).as_posix()]
-    ]
+    cp_store: object | None = None
+    cp_base_plan: dict[str, Any] | None = None
+    if checkpoint is not None:
+        cp_store, cp_base_plan = checkpoint
+    cp_records: dict[str, dict[str, Any]] = {}
+    cp_invalid: dict[str, str] = {}
+    if cp_store is not None:
+        cp_records, cp_invalid = _checkpoint_scan(cp_store)
+    cp_counts = {"new": 0, "reuse": 0, "stale": 0}
     failures = [(path.relative_to(catalog_root).as_posix(), reason) for path, reason in discovery_problems.items()]
     worker_reports: dict[str, str | None] = {}
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(_run_catalog_skill_worker, job) for job in jobs]
-        for future in as_completed(futures):
-            skill_name, passed, reason, json_report_name = future.result()
-            worker_reports[skill_name] = json_report_name
-            if not passed:
-                failures.append((skill_name, reason))
+
+    jobs: list[dict[str, Any]] = []
+    for index, skill_dir in enumerate(skill_dirs, start=1):
+        if skill_dir in discovery_problems:
+            continue
+        skill_name = skill_dir.relative_to(catalog_root).as_posix()
+        skill_output = output_dir / skill_name
+
+        cp_plan: dict[str, Any] | None = None
+        cp_fingerprint = ""
+        if cp_store is not None and cp_base_plan is not None:
+            decision, cp_plan, cp_fingerprint = _checkpoint_classify(
+                cp_store, cp_base_plan, cp_records, cp_invalid, skill_dir, skill_name
+            )
+            if decision.kind == "reuse":
+                cp_counts["reuse"] += 1
+                _print_checkpoint_reuse(index, len(skill_dirs), skill_name)
+                worker_reports[skill_name] = _checkpoint_restore(cp_store, decision.record, skill_output)
+                continue
+            cp_counts[decision.kind] += 1
+            if decision.kind == "stale":
+                click.echo(
+                    f"Warning: checkpoint for {skill_name} is unusable ({decision.reason}); re-executing.",
+                    err=True,
+                )
+
+        job: dict[str, Any] = {
+            "skill_name": skill_name,
+            "argv": _catalog_child_argv_from_ctx(ctx, skill_dir, skill_output, catalog_root=catalog_root),
+            "cwd": str(Path.cwd()),
+            "output_dir": str(skill_output),
+        }
+        if cp_store is not None:
+            job.update(
+                {
+                    "checkpoint_dir": str(getattr(cp_store, "directory")),
+                    "catalog_root": str(getattr(cp_store, "catalog_root")),
+                    "skill_relpath": skill_name,
+                    "checkpoint_plan": cp_plan,
+                    "checkpoint_fingerprint": cp_fingerprint,
+                }
+            )
+        jobs.append(job)
+
+    if jobs:
+        make_view_console().print(
+            f"[dim]Validating {len(jobs)} skill"
+            f"{'s' if len(jobs) != 1 else ''} with {workers} worker"
+            f"{'s' if workers != 1 else ''} (parallel catalog mode; per-skill pipeline view disabled)[/dim]"
+        )
+
+        checkpoint_errors: list[str] = []
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_run_catalog_skill_worker, job) for job in jobs]
+            for future in as_completed(futures):
+                skill_name, passed, reason, json_report_name, checkpoint_error = future.result()
+                worker_reports[skill_name] = json_report_name
+                if checkpoint_error:
+                    checkpoint_errors.append(f"{skill_name}: {checkpoint_error}")
+                if not passed:
+                    failures.append((skill_name, reason))
+        if checkpoint_errors:
+            raise click.ClickException(
+                "failed to write catalog checkpoints (run interrupted safety; nothing was reused): "
+                + "; ".join(checkpoint_errors[:5])
+            )
 
     failures.sort(key=lambda item: item[0])
     failure_map = dict(failures)
@@ -1445,6 +1738,8 @@ def _validate_catalog_parallel(
     ]
     _write_catalog_summary(output_dir, skill_entries)
     _print_catalog_summary(len(skill_dirs), failures, output_dir)
+    if cp_store is not None:
+        _print_checkpoint_counts(cp_counts)
     if failures:
         raise click.ClickException(
             f"{len(failures)}/{len(skill_dirs)} skills failed validation: "
@@ -1683,6 +1978,17 @@ def _print_run_banner(target_path: Path, content_type: str, profile: str | None)
     help_group=_RUN_GROUP,
     help="Concurrent catalog skill jobs when validating a folder of skills. "
     "Values above 1 run skills in parallel processes and disable the per-skill pipeline view.",
+)
+@click.option(
+    "--checkpoint-dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    cls=GroupedOption,
+    help_group=_RUN_GROUP,
+    help="Resume long catalog (directory) runs from this checkpoint directory. "
+    "Completed skills are cached per skill with a full plan fingerprint; rerunning the same "
+    "command reuses only identical-plan successes and re-executes changed, failed, incomplete, "
+    "corrupt, or foreign records. Applies to directory validation only.",
 )
 @click.option(
     "--dedup/--no-dedup",
@@ -1930,6 +2236,7 @@ def validate(
     harbor_keep_jobs: bool,
     agent_runtime_preflight: bool | None,
     workers: int,
+    checkpoint_dir: Path | None,
     evaluated_source_repository: str | None,
     evaluated_source_revision: str | None,
     evaluator_container_revision: str | None,
@@ -2052,6 +2359,54 @@ def validate(
     # A directory of skills (no root SKILL.md) is a catalog: run the pipeline
     # once per skill, each as its own job with its own reports.
     if is_catalog:
+        catalog_checkpoint: tuple[object, dict[str, Any]] | None = None
+        if checkpoint_dir is not None:
+            catalog_checkpoint = _prepare_catalog_checkpoint(
+                checkpoint_dir,
+                resolved_target=target_path,
+                skill_dirs=catalog_skill_dirs,
+                content_type=resolved_type,
+                checks=checks,
+                policy=policy,
+                profile_name=profile_name,
+                policy_path=policy_path,
+                quality_config=quality_config,
+                report_formats=report_formats,
+                verbose=verbose,
+                include_skills=include_skills,
+                options={
+                    "llm": llm,
+                    "llm_verify": llm_verify,
+                    "min_score": min_score,
+                    "fail_fast": fail_fast,
+                    "continue_on_failure": continue_on_failure,
+                    "dedup": dedup,
+                    "tier3": agent_eval,
+                    "autopilot": autopilot,
+                    "block_on_dedup": block_on_dedup_effective,
+                    "block_on_agent_eval": block_on_agent_eval_effective,
+                    "agents": agents,
+                    "env_mode": env_mode,
+                    "environment_kwarg": sorted(environment_kwarg),
+                    "skip_baseline": skip_baseline,
+                    "n_concurrent": n_concurrent,
+                    "max_agents": max_agents,
+                    "n_attempts": n_attempts,
+                    "pass_threshold": pass_threshold,
+                    "stop_on_pass": stop_on_pass,
+                    "model": model,
+                    "agent_model": list(agent_model),
+                    "grading_mode": grading_mode,
+                    "results_dir": (
+                        str(results_dir.expanduser().absolute()) if results_dir is not None else None
+                    ),
+                    "copy_repo": copy_repo,
+                    "timeout_multiplier": timeout_multiplier,
+                    "harbor_keep_jobs": harbor_keep_jobs,
+                    "agent_runtime_preflight": agent_runtime_preflight,
+                    "evaluated_source": evaluated_source,
+                },
+            )
         _validate_catalog(
             click.get_current_context(),
             resolved_target=target_path,
@@ -2059,6 +2414,7 @@ def validate(
             output_dir=output_dir,
             workers=workers,
             discovery_problems=discovery_problems,
+            checkpoint=catalog_checkpoint,
         )
         return
 

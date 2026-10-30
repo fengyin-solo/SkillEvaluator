@@ -3251,6 +3251,14 @@
           "type": "integer range"
         },
         {
+          "name": "checkpoint_dir",
+          "opts": [
+            "--checkpoint-dir"
+          ],
+          "param_type": "option",
+          "type": "directory"
+        },
+        {
           "default": "True",
           "is_flag": true,
           "name": "dedup",
