@@ -20,7 +20,9 @@ import unicodedata
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from skillevaluator.constants import QUALITY_DIMENSIONS
 from skillevaluator.evidence import evidence_ref_identity
+from skillevaluator.quality_config import format_dimension_minimums, format_dimension_weights
 from skillevaluator.reporting.base import (
     ReporterBase,
     additional_errors,
@@ -78,6 +80,30 @@ def _format_report_number(value: object, *, signed: bool = False) -> str:
     if number is None:
         return "N/A"
     return f"{number:+.2f}" if signed else f"{number:.2f}"
+
+
+def _quality_dimension_weights(config: dict) -> str | None:
+    """Render the complete normalized dimension weights, or ``None`` if malformed."""
+    weights = config.get("dimension_weights")
+    if not isinstance(weights, dict):
+        return None
+    for name in QUALITY_DIMENSIONS:
+        number = _finite_report_number(weights.get(name))
+        if number is None or number < 0:
+            return None
+    return format_dimension_weights(weights)
+
+
+def _quality_dimension_minimums(config: dict) -> str | None:
+    """Render configured dimension minimums, or ``None`` when absent/malformed."""
+    minimums = config.get("dimension_minimums")
+    if not isinstance(minimums, dict) or not minimums:
+        return None
+    for name, value in minimums.items():
+        number = _finite_report_number(value)
+        if name not in QUALITY_DIMENSIONS or number is None or not 0 <= number <= 100:
+            return None
+    return format_dimension_minimums(minimums)
 
 
 def _markdown_inline_text(value: object, *, limit: int | None = None) -> str:
@@ -251,6 +277,12 @@ class MarkdownReporter(ReporterBase):
             lines.append(
                 f"**Quality config:** {source}{file_label}, `{quality_config.get('digest', '')}`{min_score_label}"
             )
+            weights = _quality_dimension_weights(quality_config)
+            if weights is not None:
+                lines.append(f"**Quality dimension weights:** {weights}")
+            minimums = _quality_dimension_minimums(quality_config)
+            if minimums is not None:
+                lines.append(f"**Quality dimension minimums:** {minimums}")
 
         if self.include_timestamp:
             timestamp = datetime.now(tz=UTC).strftime("%B %d, %Y at %I:%M %p UTC")

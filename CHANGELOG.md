@@ -65,6 +65,21 @@ All notable changes to SkillEvaluator are documented in this file.
   `quality_config` (`packaged` or `custom`, the custom file's name, a
   `sha256:` digest of the normalized rules, and the `--min-score` pass
   threshold, which is kept out of the digest).
+- `--quality-config` files can now rebalance quality scoring with
+  `dimension_weights` for correctness, discoverability, reliability, and
+  efficiency (finite non-negative values that sum to 1; all four required
+  when the block is present) and set `dimension_minimums` (0-100) for any
+  subset of dimensions. A dimension below its minimum fails even when the
+  weighted total reaches `--min-score`; the gate failure names the dimension,
+  score, and threshold, survives policy overrides and folder averages, and is
+  enforced identically by `quality-check` and `validate`. Invalid blocks
+  (unknown dimensions, missing weights, negative, non-finite or non-numeric
+  values, weights not summing to 1, minimums outside 0-100) are rejected with
+  exit code 2 before validation starts. Scores use compensated summation so
+  equivalent decimal weights cannot change the result, and a folder run parses
+  the config once into one immutable snapshot shared by every skill. Reports
+  record the effective weights, minimums, and normalized digest rather than
+  only the config file name.
 - CI-native per-skill HTML pages link Download JSON to the retained
   `skillevaluator-tier1.json` and do not embed a second copy of the report
   JSON. Standalone CLI HTML reports embed it for Export JSON.

@@ -129,7 +129,7 @@ errors, such as an option the workflow does not accept, exit `2`.
 | `--checks TEXT` | All applicable static checks, including dependency auditing | Comma-separated subset of static checks |
 | `--llm / --no-llm` | Enabled when a provider is configured | Enable or skip rubric, LLM security, and finding verification; explicit `--llm` requires valid provider configuration |
 | `--min-score INTEGER` | `70` | Minimum passing quality and rubric score, from 0 to 100; quality severity overrides cannot waive the minimum |
-| `--quality-config PATH` | packaged `quality-default.yaml` | YAML file that replaces the quality check's expected-heading rules. See [Tier 1: Validation](tier1-validation.mdx#the-checks). |
+| `--quality-config PATH` | packaged `quality-default.yaml` | YAML file that replaces the quality check's expected-heading rules and may set `dimension_weights` and `dimension_minimums`. See [Tier 1: Validation](tier1-validation.mdx#the-checks). |
 | `--profile TEXT` | `SKILLEVALUATOR_PROFILE`, then `external` | Validation policy profile |
 | `--previous-version TEXT` | `SKILLEVALUATOR_PREVIOUS_VERSION`, else unset | Previous version for version checks |
 
@@ -239,7 +239,7 @@ Static checks; LLM-free by default. Tier 1 gates the exit code and always runs.
 | `--llm, --tier1-llm / --no-llm, --no-tier1-llm` | `no-llm` | Enable LLM-backed security analysis (requires a configured public provider — see [Providers & Credentials](configuration.mdx)). |
 | `--llm-verify` | off | Run a second LLM pass to suppress false-positive findings. |
 | `--min-score INTEGER` | `70` | Minimum quality score (0–100) required per skill when the `quality` check runs; policy severity overrides cannot waive this gate. |
-| `--quality-config PATH` | packaged `quality-default.yaml` | YAML file that replaces the quality check's expected-heading rules. See [Tier 1: Validation](tier1-validation.mdx#the-checks). |
+| `--quality-config PATH` | packaged `quality-default.yaml` | YAML file that replaces the quality check's expected-heading rules and may set `dimension_weights` and `dimension_minimums`. See [Tier 1: Validation](tier1-validation.mdx#the-checks). |
 
 ### Tier 2 · Deduplication
 
@@ -303,12 +303,13 @@ skillevaluator quality-check ./my-skill
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `--min-score INTEGER` | `70` | Minimum composite score required per skill; passing also requires no HIGH or CRITICAL quality findings. |
-| `--quality-config PATH` | packaged `quality-default.yaml` | YAML file with expected section headers and rules for grading. |
+| `--quality-config PATH` | packaged `quality-default.yaml` | YAML file with expected section headers, `dimension_weights`, and `dimension_minimums` for grading. |
 
 Plus the standard report options. A collection's displayed average does not
-replace the minimum required of each skill. Scoring weights, grade bands, the
-independent minimum-score gate, and the `--quality-config` file format are
-documented in [Tier 1: Validation](tier1-validation.mdx).
+replace the minimum required of each skill (including its dimension minimums).
+Scoring weights, grade bands, the independent minimum-score gate, and the
+`--quality-config` file format are documented in
+[Tier 1: Validation](tier1-validation.mdx).
 
 ## rubric-eval
 

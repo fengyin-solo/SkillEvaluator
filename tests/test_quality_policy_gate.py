@@ -69,6 +69,42 @@ def test_raising_efficiency_severity_keeps_cli_minimum_score_failure(
     assert "67.8/100 is below the required 70/100" in output
 
 
+def test_cli_quality_check_fails_on_dimension_minimum_even_when_total_passes(
+    below_threshold_skill: Path, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text(
+        "expected_headers: []\n"
+        "dimension_weights:\n"
+        "  correctness: 0.0\n"
+        "  discoverability: 0.0\n"
+        "  reliability: 1.0\n"
+        "  efficiency: 0.0\n"
+        "dimension_minimums:\n"
+        "  discoverability: 70\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "quality-check",
+            str(below_threshold_skill),
+            "--quality-config",
+            str(config_path),
+            "-r",
+            "cli",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    output = strip_terminal_controls(result.output)
+    assert "Quality discoverability score 60.0/100 is below the required minimum 70/100" in output
+    # The weighted total (reliability 90 with no heading rules) clears 70, so
+    # only the dimension minimum is reported as a gate failure.
+    assert "below the required 70/100" not in output
+
+
 def test_pipeline_explains_minimum_score_failure(below_threshold_skill: Path) -> None:
     result = QualityScoreValidator(min_score=70).validate(below_threshold_skill)
     passed, rows = summarize_tier1([result])

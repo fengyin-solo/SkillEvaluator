@@ -287,10 +287,41 @@ For `validate`, the default set is `schema`, `version`, `security`, `pii`, `lice
 
     An entry is satisfied when the heading or any alternative appears anywhere in `SKILL.md` as text, so `## Security` also matches `### Security Notes` or a heading inside a code block.
 
-    The file is checked before any validation runs. A file that is missing, unreadable, not UTF-8, invalid YAML, has an unknown key (such as `point` instead of `points`), or lists the same heading twice is a usage error: the command exits with code 2 and names the file and the problem. `validate` checks the file even when `--checks` leaves out `quality`.
+    **Dimension weights.** The four dimensions are combined with fixed default weights — correctness 0.35, discoverability 0.25, reliability 0.25, and efficiency 0.15. A `dimension_weights` block in the config can rebalance them for a team's priorities. All four dimensions must be named, each value must be a finite non-negative number, and the values must sum to 1 (a tiny float tolerance accepts decimal sets like `0.1 + 0.2 + 0.3 + 0.4`). Omitting the block keeps the packaged 35/25/25/15 weights.
+
+    ```yaml title="quality.yaml — correctness-first scoring"
+    expected_headers: []
+    dimension_weights:
+      correctness: 0.5
+      discoverability: 0.2
+      reliability: 0.2
+      efficiency: 0.1
+    ```
+
+    **Dimension minimums.** Use `dimension_minimums` to set an independent floor on any subset of dimensions. Each value is a number from 0 to 100; dimensions not listed have no extra floor. A skill fails when any named dimension is below its minimum, **even when the weighted total reaches `--min-score`**. The diagnostic names the failed dimension, its score, and the threshold, for example `Quality reliability score 55.0/100 is below the required minimum 60/100`. Like the weighted-total gate, minimums survive policy severity overrides and folder averages, and are recorded in `gate_failures`.
+
+    ```yaml title="quality.yaml — reliability must pass regardless of total"
+    expected_headers: []
+    dimension_minimums:
+      reliability: 60
+      efficiency: 50
+    ```
+
+    | Block | Required keys | Value rules |
+    | --- | --- | --- |
+    | `dimension_weights` | All four dimensions when the block is present | Finite non-negative numbers summing to 1; booleans, strings, and `.nan`/`.inf` are rejected |
+    | `dimension_minimums` | Any subset of the four dimensions | Numbers from 0 to 100; omitted dimensions have no minimum |
+
+    Every report records the effective rules, not just the file name: the JSON report carries `dimension_weights` and `dimension_minimums` under `quality_config` alongside the config digest and `min_score`; the Markdown report and `BENCHMARK.md` card show `Quality dimension weights:` and, when configured, `Quality dimension minimums:` lines.
+
+    The file is parsed once per run and the normalized config (headings, weights, and minimums) is shared immutably by every skill in a folder evaluation. The file is checked before any validation runs: a file that is missing, unreadable, not UTF-8, invalid YAML, has an unknown key (such as `point` instead of `points`), lists the same heading twice, names an unknown dimension, omits a dimension from `dimension_weights`, uses a negative or non-finite number, has weights that do not sum to 1, or sets a minimum outside 0-100 is a usage error. The command exits with code 2 and names the file and the problem; `validate` checks the file even when `--checks` leaves out `quality`.
 
     ```text title="Example error"
     Error: Invalid value for '--quality-config': quality.yaml: unknown key(s) in expected_headers[0]: point (allowed: alternatives, heading, message, points, suggestion)
+    ```
+
+    ```text title="Example weight error"
+    Error: Invalid value for '--quality-config': quality.yaml: dimension_weights must set all four dimensions; missing: efficiency
     ```
   </Accordion>
 

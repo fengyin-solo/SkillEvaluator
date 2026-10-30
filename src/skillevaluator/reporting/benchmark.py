@@ -18,11 +18,13 @@ from skillevaluator.constants import (
     DIMENSION_MAPPING,
     DIMENSION_VERDICT_NEUTRAL_THRESHOLD,
     DIMENSION_VERDICT_PASS_THRESHOLD,
+    QUALITY_DIMENSIONS,
     TIER3_LIFT_FAIL_THRESHOLD,
     TIER3_LIFT_PASS_THRESHOLD,
 )
 from skillevaluator.publication_evidence import result_has_publication_evidence, result_publication_evidence
 from skillevaluator.publication_text import publication_confusable_skeleton
+from skillevaluator.quality_config import format_dimension_minimums, format_dimension_weights
 from skillevaluator.reporting.base import (
     PublicationTargetIdentity,
     ReporterBase,
@@ -273,6 +275,12 @@ class BenchmarkReporter(ReporterBase):
         quality_min_score = _quality_min_score(results)
         if quality_min_score is not None:
             lines.append(f"- Quality min score: {quality_min_score}")
+        quality_weights = _quality_dimension_weights(results)
+        if quality_weights:
+            lines.append(f"- Quality dimension weights: {quality_weights}")
+        quality_minimums = _quality_dimension_minimums(results)
+        if quality_minimums:
+            lines.append(f"- Quality dimension minimums: {quality_minimums}")
 
         evaluated_at = _evaluated_at(ae)
         lines.append(
@@ -967,6 +975,43 @@ def _quality_min_score(results: list[ValidationResult]) -> int | float | None:
         min_score = config.get("min_score") if isinstance(config, dict) else None
         if isinstance(min_score, (int, float)) and not isinstance(min_score, bool) and math.isfinite(min_score):
             return min_score
+    return None
+
+
+def _valid_quality_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _quality_dimension_weights(results: list[ValidationResult]) -> str | None:
+    """Return the effective dimension weights, or ``None`` when no complete record exists."""
+    for result in results:
+        config = result.metadata.get("quality_config") if isinstance(result.metadata, dict) else None
+        weights = config.get("dimension_weights") if isinstance(config, dict) else None
+        if not isinstance(weights, dict):
+            continue
+        complete = all(
+            name in weights and _valid_quality_number(weights[name]) and weights[name] >= 0
+            for name in QUALITY_DIMENSIONS
+        )
+        if not complete:
+            continue
+        return format_dimension_weights(weights)
+    return None
+
+
+def _quality_dimension_minimums(results: list[ValidationResult]) -> str | None:
+    """Return the configured per-dimension minimums, or ``None`` when none were recorded."""
+    for result in results:
+        config = result.metadata.get("quality_config") if isinstance(result.metadata, dict) else None
+        minimums = config.get("dimension_minimums") if isinstance(config, dict) else None
+        if not isinstance(minimums, dict) or not minimums:
+            continue
+        if any(
+            name not in QUALITY_DIMENSIONS or not _valid_quality_number(value) or not 0 <= value <= 100
+            for name, value in minimums.items()
+        ):
+            continue
+        return format_dimension_minimums(minimums)
     return None
 
 

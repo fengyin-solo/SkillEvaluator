@@ -9,7 +9,7 @@ import pytest
 
 from skillevaluator.models.quality import QualityScoreResult, score_to_grade
 from skillevaluator.quality_config import load_quality_config, quality_config_digest
-from skillevaluator.tier1.commands import run_validation
+from skillevaluator.tier1.commands import run_quality_check, run_validation
 from skillevaluator.validators.quality_score import QualityScoreValidator
 
 
@@ -317,9 +317,7 @@ class TestQualityScoreValidator:
             pytest.param("\nSecurity\n========\n\nReview permissions.\n", False, id="setext-heading"),
         ],
     )
-    def test_expected_header_matches_heading_as_text_anywhere(
-        self, tmp_path: Path, extra_body: str, satisfied: bool
-    ):
+    def test_expected_header_matches_heading_as_text_anywhere(self, tmp_path: Path, extra_body: str, satisfied: bool):
         skill_dir = _write_issue_skill(tmp_path, extra_body=extra_body)
         config_path = tmp_path / "quality.yaml"
         config_path.write_text(
@@ -343,9 +341,7 @@ class TestQualityScoreValidator:
 
         result = QualityScoreValidator(min_score=0).validate(skill_dir)
 
-        assert all(
-            finding.message != "No prerequisites/requirements documented" for finding in result.findings
-        )
+        assert all(finding.message != "No prerequisites/requirements documented" for finding in result.findings)
 
     @pytest.mark.parametrize("alternative", ["## Common Issues", "## FAQ"])
     def test_troubleshooting_header_accepts_configured_alternative(self, tmp_path: Path, alternative: str):
@@ -655,6 +651,13 @@ class TestQualityScoreValidator:
             "file": None,
             "digest": quality_config_digest(load_quality_config()),
             "min_score": 70,
+            "dimension_weights": {
+                "correctness": 0.35,
+                "discoverability": 0.25,
+                "reliability": 0.25,
+                "efficiency": 0.15,
+            },
+            "dimension_minimums": {},
         }
 
     def test_result_records_custom_quality_config_file_name_only(self, tmp_path: Path):
@@ -662,14 +665,17 @@ class TestQualityScoreValidator:
         config_path = tmp_path / "configs" / "team-quality.yaml"
         config_path.parent.mkdir()
         config_path.write_text("expected_headers: []\n", encoding="utf-8")
+        config = load_quality_config(config_path)
 
         result = QualityScoreValidator(min_score=80, quality_config=config_path).validate(skill_dir)
 
         assert result.metadata["quality_config"] == {
             "source": "custom",
             "file": "team-quality.yaml",
-            "digest": quality_config_digest({"expected_headers": []}),
+            "digest": quality_config_digest(config),
             "min_score": 80,
+            "dimension_weights": dict(config["dimension_weights"]),
+            "dimension_minimums": {},
         }
 
     def test_folder_result_records_quality_config(self, tmp_path: Path):
@@ -1243,3 +1249,223 @@ class TestQualityScoreDeterministicContracts:
         )
 
         assert "Instructions lack clear action verbs" not in messages
+
+
+_DEFICIENT_BODY = (
+    "---\n"
+    "name: minimal-skill\n"
+    "description: I can handle various things and stuff for your data documents and projects. "
+    "This general tool processes files and helps your workflow.\n"
+    "---\n"
+    "Short content.\n\n"
+    "## Instructions\n\n"
+    "The paradigm is synergy and awareness.\n"
+)
+
+
+def _write_deficient_skill(tmp_path: Path, name: str = "minimal-skill") -> Path:
+    skill_dir = tmp_path / name
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(_DEFICIENT_BODY, encoding="utf-8")
+    return skill_dir
+
+
+def _write_weights_config(tmp_path: Path, weights: dict[str, float], minimums: dict[str, float] | None = None) -> Path:
+    lines = ["expected_headers: []", "dimension_weights:"]
+    lines.extend(f"  {name}: {weight}" for name, weight in weights.items())
+    if minimums:
+        lines.append("dimension_minimums:")
+        lines.extend(f"  {name}: {minimum}" for name, minimum in minimums.items())
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config_path
+
+
+_ALL_WEIGHT_NAMES = ("correctness", "discoverability", "reliability", "efficiency")
+
+
+class TestConfigurableDimensionWeights:
+    def test_model_applies_injected_weights_to_every_dimension(self) -> None:
+        weights = {"correctness": 0.5, "discoverability": 0.2, "reliability": 0.2, "efficiency": 0.1}
+        qs = QualityScoreResult(skill_name="test", weights=weights)
+
+        assert [qs.dimensions[i].weight for i in range(4)] == [0.5, 0.2, 0.2, 0.1]
+        qs.correctness.score = 80.0
+        qs.discoverability.score = 60.0
+        qs.reliability.score = 90.0
+        qs.efficiency.score = 70.0
+
+        assert qs.overall_score == pytest.approx(80 * 0.5 + 60 * 0.2 + 90 * 0.2 + 70 * 0.1)
+
+    def test_default_validator_description_is_unchanged(self) -> None:
+        assert QualityScoreValidator().description == (
+            "Skill quality scoring across Correctness (35%), Discoverability (25%),"
+            " Reliability (25%), and Efficiency (15%)"
+        )
+
+    def test_custom_weights_change_overall_score_and_dimension_weights(self, tmp_path: Path) -> None:
+        skill_dir = _write_deficient_skill(tmp_path)
+        config_path = _write_weights_config(
+            tmp_path, {"correctness": 1.0, "discoverability": 0.0, "reliability": 0.0, "efficiency": 0.0}
+        )
+
+        result = QualityScoreValidator(min_score=0, quality_config=config_path).validate(skill_dir)
+        qs = result.metadata["quality_scores"]
+
+        assert qs["overall_score"] == 65.0
+        assert qs["grade"] == "D"
+        assert {name: qs["dimensions"][name]["weight"] for name in _ALL_WEIGHT_NAMES} == {
+            "correctness": 1.0,
+            "discoverability": 0.0,
+            "reliability": 0.0,
+            "efficiency": 0.0,
+        }
+
+    def test_description_reflects_configured_weights(self, tmp_path: Path) -> None:
+        config_path = _write_weights_config(
+            tmp_path, {"correctness": 0.5, "discoverability": 0.2, "reliability": 0.2, "efficiency": 0.1}
+        )
+
+        validator = QualityScoreValidator(quality_config=config_path)
+
+        assert validator.description == (
+            "Skill quality scoring across Correctness (50%), Discoverability (20%),"
+            " Reliability (20%), and Efficiency (10%)"
+        )
+
+    def test_weights_are_recorded_in_result_metadata(self, tmp_path: Path) -> None:
+        skill_dir = _write_deficient_skill(tmp_path)
+        config_path = _write_weights_config(
+            tmp_path,
+            {"correctness": 0.5, "discoverability": 0.2, "reliability": 0.2, "efficiency": 0.1},
+            minimums={"reliability": 80},
+        )
+
+        result = QualityScoreValidator(min_score=70, quality_config=config_path).validate(skill_dir)
+        config = result.metadata["quality_config"]
+
+        assert config["dimension_weights"] == pytest.approx(
+            {"correctness": 0.5, "discoverability": 0.2, "reliability": 0.2, "efficiency": 0.1}
+        )
+        assert config["dimension_minimums"] == {"reliability": 80.0}
+
+    def test_repeated_runs_with_one_config_are_deterministic(self, tmp_path: Path) -> None:
+        skill_dir = _write_deficient_skill(tmp_path)
+        config_path = _write_weights_config(
+            tmp_path,
+            {"correctness": 0.1, "discoverability": 0.2, "reliability": 0.3, "efficiency": 0.4},
+        )
+        validator = QualityScoreValidator(min_score=0, quality_config=config_path)
+
+        first = validator.validate(skill_dir).metadata["quality_scores"]
+        second = validator.validate(skill_dir).metadata["quality_scores"]
+
+        assert first == second
+
+
+class TestDimensionMinimums:
+    def test_minimum_fails_even_when_weighted_total_clears_min_score(self, tmp_path: Path) -> None:
+        skill_dir = _write_deficient_skill(tmp_path)
+        # The custom config drops expected-heading deductions, so reliability
+        # scores 90 and carries the whole weighted total; the discoverability
+        # floor of 70 is failed at 60 while the total easily clears --min-score.
+        config_path = _write_weights_config(
+            tmp_path,
+            {"correctness": 0.0, "discoverability": 0.0, "reliability": 1.0, "efficiency": 0.0},
+            minimums={"discoverability": 70},
+        )
+
+        result = QualityScoreValidator(min_score=70, quality_config=config_path).validate(skill_dir)
+        qs = result.metadata["quality_scores"]
+
+        assert qs["overall_score"] == 90.0
+        assert not result.passed
+        minimum_failures = [msg for msg in result.gate_failures if "below the required minimum" in msg]
+        assert len(minimum_failures) == 1
+        assert "Quality discoverability score 60.0/100 is below the required minimum 70/100" in minimum_failures[0]
+        assert "SKILL.md" in minimum_failures[0]
+        # The weighted-total gate itself is not also reported for this skill.
+        assert not any("below the required 70/100" in msg for msg in result.gate_failures)
+
+    def test_dimension_exactly_at_minimum_passes(self, tmp_path: Path) -> None:
+        skill_dir = _write_issue_skill(tmp_path)  # every dimension scores 100
+        config_path = _write_weights_config(
+            tmp_path,
+            {"correctness": 0.25, "discoverability": 0.25, "reliability": 0.25, "efficiency": 0.25},
+            minimums=dict.fromkeys(_ALL_WEIGHT_NAMES, 100),
+        )
+
+        result = QualityScoreValidator(min_score=100, quality_config=config_path).validate(skill_dir)
+
+        assert result.passed
+        assert result.gate_failures == []
+
+    def test_every_dimension_below_its_minimum_is_named(self, tmp_path: Path) -> None:
+        skill_dir = _write_deficient_skill(tmp_path)
+        config_path = _write_weights_config(
+            tmp_path,
+            {"correctness": 0.25, "discoverability": 0.25, "reliability": 0.25, "efficiency": 0.25},
+            minimums=dict.fromkeys(_ALL_WEIGHT_NAMES, 100),
+        )
+
+        result = QualityScoreValidator(min_score=0, quality_config=config_path).validate(skill_dir)
+
+        failures = [msg for msg in result.gate_failures if "below the required minimum" in msg]
+        assert len(failures) == 4
+        for name in _ALL_WEIGHT_NAMES:
+            assert any(f"Quality {name} score" in msg and "minimum 100/100" in msg for msg in failures)
+
+    def test_minimum_failures_agree_between_quality_check_and_validate(self, tmp_path: Path) -> None:
+        skill_dir = _write_deficient_skill(tmp_path)
+        config_path = _write_weights_config(
+            tmp_path,
+            {"correctness": 0.0, "discoverability": 0.0, "reliability": 1.0, "efficiency": 0.0},
+            minimums={"discoverability": 70},
+        )
+
+        quality_check = run_quality_check(skill_dir, min_score=70, quality_config=config_path)
+        validation = run_validation(
+            skill_dir, checks="quality", min_score=70, quality_config=config_path, on_check=lambda _: None
+        )
+        quality_validation = next(result for result in validation if result.validator_name == "QUALITY")
+
+        assert quality_check[0].passed is quality_validation.passed is False
+        assert quality_check[0].gate_failures == quality_validation.gate_failures
+
+    def test_minimum_failures_survive_folder_merge_with_skill_prefix(self, tmp_path: Path) -> None:
+        root = tmp_path / "skills"
+        root.mkdir()
+        strong = _write_issue_skill(root, name="strong-skill")
+        weak = _write_deficient_skill(root, name="weak-skill")
+        config_path = _write_weights_config(
+            tmp_path,
+            {"correctness": 1.0, "discoverability": 0.0, "reliability": 0.0, "efficiency": 0.0},
+            minimums={"correctness": 90},
+        )
+        assert strong.exists() and weak.exists()
+
+        result = QualityScoreValidator(min_score=0, quality_config=config_path).validate(root)
+        all_quality = result.metadata["quality_scores_all"]
+
+        # Both skills were scored against the same parsed weights.
+        assert all(q["dimensions"]["correctness"]["weight"] == 1.0 for q in all_quality)
+        assert all(q["dimensions"]["efficiency"]["weight"] == 0.0 for q in all_quality)
+        assert not result.passed
+        minimum_failures = [msg for msg in result.gate_failures if "below the required minimum" in msg]
+        assert len(minimum_failures) == 1
+        assert minimum_failures[0].startswith("[weak-skill]")
+        assert "Quality correctness score 65.0/100 is below the required minimum 90/100" in minimum_failures[0]
+
+    def test_folder_result_records_weights_and_minimums_once(self, tmp_path: Path) -> None:
+        _write_deficient_skill(tmp_path)
+        config_path = _write_weights_config(
+            tmp_path,
+            {"correctness": 0.5, "discoverability": 0.2, "reliability": 0.2, "efficiency": 0.1},
+            minimums={"reliability": 60},
+        )
+
+        result = QualityScoreValidator(min_score=0, quality_config=config_path).validate(tmp_path)
+        config = result.metadata["quality_config"]
+
+        assert set(config["dimension_weights"]) == set(_ALL_WEIGHT_NAMES)
+        assert config["dimension_minimums"] == {"reliability": 60.0}

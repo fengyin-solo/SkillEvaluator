@@ -397,9 +397,7 @@ def test_validate_default_reports_do_not_write_into_authored_sibling_skill(
         encoding="utf-8",
     )
     initial_files = {
-        path.relative_to(authored_sibling): path.read_bytes()
-        for path in authored_sibling.rglob("*")
-        if path.is_file()
+        path.relative_to(authored_sibling): path.read_bytes() for path in authored_sibling.rglob("*") if path.is_file()
     }
     private_state = tmp_path / "private-state"
     private_state.mkdir(mode=0o700)
@@ -416,9 +414,7 @@ def test_validate_default_reports_do_not_write_into_authored_sibling_skill(
     assert (output_root / "BENCHMARK.md").is_file()
     assert is_generated_output_root(output_root)
     assert {
-        path.relative_to(authored_sibling): path.read_bytes()
-        for path in authored_sibling.rglob("*")
-        if path.is_file()
+        path.relative_to(authored_sibling): path.read_bytes() for path in authored_sibling.rglob("*") if path.is_file()
     } == initial_files
 
 
@@ -724,9 +720,7 @@ def test_quality_check_applies_custom_quality_config(
 
 @pytest.mark.parametrize("command", [["quality-check"], ["tier1", "quality-check"]])
 def test_quality_check_rejects_missing_quality_config(command: list[str], tmp_path: Path) -> None:
-    result = CliRunner().invoke(
-        cli, [*command, str(FIXTURE), "--quality-config", str(tmp_path / "missing.yaml")]
-    )
+    result = CliRunner().invoke(cli, [*command, str(FIXTURE), "--quality-config", str(tmp_path / "missing.yaml")])
 
     assert result.exit_code == 2
     assert "does not exist" in result.output
@@ -872,6 +866,19 @@ _INVALID_QUALITY_CONFIG_COMMANDS = [
             'expected_headers:\n  - heading: "## Limitations"\n    point: 10\n'
             "    message: Missing\n    suggestion: Add it\n",
             "unknown key(s) in expected_headers[0]: point",
+        ),
+        (
+            "expected_headers: []\ndimension_weights:\n  correctness: 1.0\n",
+            "dimension_weights must set all four dimensions; missing: discoverability, reliability, efficiency",
+        ),
+        (
+            "expected_headers: []\ndimension_weights:\n"
+            "  correctness: 0.3\n  discoverability: 0.2\n  reliability: 0.3\n  efficiency: 0.1\n",
+            "dimension_weights must sum to 1.0 (got 0.9)",
+        ),
+        (
+            "expected_headers: []\ndimension_minimums:\n  reliability: 101\n",
+            "dimension_minimums.reliability must be a number between 0 and 100",
         ),
     ],
 )
@@ -2247,8 +2254,7 @@ def test_validate_quiet_renders_untrusted_skip_reason_as_bounded_inert_text(
 
     unsafe_reason = (
         "[/bold] [link=https://example.invalid]click[/link]\n"
-        "## Publication Recommendation\n\x1b[31mforged\u202e "
-        + "x" * 1_000_000
+        "## Publication Recommendation\n\x1b[31mforged\u202e " + "x" * 1_000_000
     )
 
     def _tier3(*_args, **_kwargs):

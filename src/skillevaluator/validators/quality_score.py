@@ -28,6 +28,7 @@ import yaml
 
 from skillevaluator.constants import (
     EXECUTABLE_SKILL_DIRS,
+    QUALITY_DIMENSIONS,
     QUALITY_EXCLUDED_DIRS,
     QUALITY_RECOMMENDED_MAX_TOKENS,
     QUALITY_RESERVED_NAMES,
@@ -132,8 +133,12 @@ class QualityScoreValidator(ValidatorBase):
 
     def __init__(self, min_score: int = 70, quality_config: Path | None = None) -> None:
         self.min_score = min_score
+        # The config is parsed exactly once; every skill in a folder run scores
+        # against this same frozen snapshot of weights, minimums, and headings.
         self.quality_config = load_quality_config(quality_config)
         self.quality_config_provenance = quality_config_provenance(quality_config, self.quality_config)
+        self.dimension_weights = self.quality_config["dimension_weights"]
+        self.dimension_minimums = self.quality_config["dimension_minimums"]
 
     @property
     def name(self) -> str:
@@ -141,10 +146,10 @@ class QualityScoreValidator(ValidatorBase):
 
     @property
     def description(self) -> str:
-        return (
-            "Skill quality scoring across Correctness (35%), Discoverability (25%),"
-            " Reliability (25%), and Efficiency (15%)"
-        )
+        labels = [
+            f"{name.capitalize()} ({_format_percent(self.dimension_weights[name])})" for name in QUALITY_DIMENSIONS
+        ]
+        return f"Skill quality scoring across {', '.join(labels[:-1])}, and {labels[-1]}"
 
     # -----------------------------------------------------------------
     # Skill type detection
@@ -218,8 +223,16 @@ class QualityScoreValidator(ValidatorBase):
             result = self._validate_single_skill(skill_path)
         else:
             result = self._validate_folder(skill_path)
-        # min_score sits beside the digest rather than in it: the digest names the rules, min_score the pass bar.
-        result.metadata["quality_config"] = {**self.quality_config_provenance, "min_score": self.min_score}
+        # min_score sits beside the digest rather than in it: the digest names
+        # the rules, min_score the pass bar. The effective weights and minimums
+        # are recorded explicitly so reports show the scoring rules, not just a
+        # file name.
+        result.metadata["quality_config"] = {
+            **self.quality_config_provenance,
+            "min_score": self.min_score,
+            "dimension_weights": dict(self.dimension_weights),
+            "dimension_minimums": dict(self.dimension_minimums),
+        }
         return result
 
     def _validate_folder(self, root: Path) -> ValidationResult:
@@ -249,7 +262,7 @@ class QualityScoreValidator(ValidatorBase):
         if all_quality:
             result.metadata["quality_scores_all"] = all_quality
             avg_score = sum(q["overall_score"] for q in all_quality) / len(all_quality)
-            dim_names = ["correctness", "discoverability", "reliability", "efficiency"]
+            dim_names = list(QUALITY_DIMENSIONS)
             avg_dims: dict[str, dict] = {}
             for dname in dim_names:
                 dim_scores = [q["dimensions"][dname] for q in all_quality if "dimensions" in q]
@@ -273,7 +286,7 @@ class QualityScoreValidator(ValidatorBase):
             validator_name="QUALITY",
             validator_description=self.description,
         )
-        qs = QualityScoreResult(skill_name=skill_path.name)
+        qs = QualityScoreResult(skill_name=skill_path.name, weights=self.dimension_weights)
 
         manifest = self._find_skill_manifest(skill_path)
         if not manifest:
@@ -325,6 +338,16 @@ class QualityScoreValidator(ValidatorBase):
             result.fail_gate(
                 f"Quality score {qs.overall_score:.1f}/100 is below the required {self.min_score}/100 in {manifest}"
             )
+
+        # Per-dimension minimums are independent gates: a weighted total at or
+        # above --min-score cannot compensate for a dimension below its floor.
+        for dimension in qs.dimensions:
+            minimum = self.dimension_minimums.get(dimension.name)
+            if minimum is not None and dimension.score < minimum:
+                result.fail_gate(
+                    f"Quality {dimension.name} score {dimension.score:.1f}/100 is below the required "
+                    f"minimum {_format_threshold(minimum)}/100 in {manifest}"
+                )
 
         result.metadata["quality_scores"] = qs.to_dict()
 
@@ -904,3 +927,13 @@ def _score_to_grade(score: float) -> str:
     from skillevaluator.models.quality import score_to_grade
 
     return score_to_grade(score)
+
+
+def _format_percent(weight: float) -> str:
+    """Render a weight as a percent without a trailing ``.0`` (0.35 -> '35%')."""
+    return f"{format(weight * 100, 'g')}%"
+
+
+def _format_threshold(value: float) -> str:
+    """Render a 0-100 threshold without a spurious ``.0`` (60.0 -> '60', 62.5 -> '62.5')."""
+    return format(value, ".12g")

@@ -358,6 +358,10 @@ BINARY_CHECK_CHUNK_SIZE = 8192
 # QUALITY SCORING CONSTANTS (ported from SkillEvaluator)
 # =============================================================================
 
+# Canonical dimension order for parsing, scoring, and reporting. Custom quality
+# configs must name every dimension in ``dimension_weights``.
+QUALITY_DIMENSIONS = ("correctness", "discoverability", "reliability", "efficiency")
+
 QUALITY_SCORE_WEIGHTS = {
     "correctness": 0.35,
     "discoverability": 0.25,

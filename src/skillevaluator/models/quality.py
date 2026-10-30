@@ -10,7 +10,9 @@ Ported from SkillEvaluator SkillQualityAnalyzer scoring system. Provides:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from collections.abc import Mapping
+from dataclasses import InitVar, dataclass, field
 
 from skillevaluator.constants import (
     QUALITY_GRADE_THRESHOLDS,
@@ -96,6 +98,9 @@ class QualityScoreResult:
 
     skill_name: str = ""
     skill_type: str = "unknown"
+    # Optional parsed ``dimension_weights`` from the active quality config.
+    # Defaults to the packaged 35/25/25/15 weights when omitted.
+    weights: InitVar[Mapping[str, float] | None] = None
 
     correctness: QualityDimension = field(
         default_factory=lambda: QualityDimension(name="correctness", weight=QUALITY_SCORE_WEIGHTS["correctness"])
@@ -112,6 +117,11 @@ class QualityScoreResult:
         default_factory=lambda: QualityDimension(name="efficiency", weight=QUALITY_SCORE_WEIGHTS["efficiency"])
     )
 
+    def __post_init__(self, weights: Mapping[str, float] | None) -> None:
+        if weights is not None:
+            for dimension in self.dimensions:
+                dimension.weight = float(weights[dimension.name])
+
     # Metrics
     total_tokens: int = 0
     frontmatter_tokens: int = 0
@@ -126,12 +136,9 @@ class QualityScoreResult:
 
     @property
     def overall_score(self) -> float:
-        return (
-            self.correctness.weighted_score
-            + self.discoverability.weighted_score
-            + self.reliability.weighted_score
-            + self.efficiency.weighted_score
-        )
+        # Compensated summation in canonical dimension order keeps weighted
+        # totals free of order-dependent float drift near grade/gate boundaries.
+        return math.fsum(dimension.weighted_score for dimension in self.dimensions)
 
     @property
     def grade(self) -> str:
