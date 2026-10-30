@@ -73,6 +73,7 @@ from skillevaluator.reporting.base import (
 )
 from skillevaluator.reporting.harbor_viewer import normalize_agent_eval_harbor_links
 from skillevaluator.reporting.presentation import success_is_not_applicable
+from skillevaluator.suppressions import get_suppression_ledger, suppressed_finding_records
 
 if TYPE_CHECKING:
     from skillevaluator.models import ValidationResult
@@ -2351,6 +2352,9 @@ class HTMLReporter(ReporterBase):
                         "metadata": detail.metadata,
                     }
                 )
+            suppressed = suppressed_finding_records(result)
+            if suppressed:
+                result_dict["suppressed_findings"] = suppressed
             coverage = result.metadata.get("dependency_coverage")
             if isinstance(coverage, list):
                 result_dict["dependency_coverage"] = coverage
@@ -3024,6 +3028,11 @@ class HTMLReporter(ReporterBase):
             },
             "skillspector_versions": tier1_skillspector_versions,
         }
+        suppression_ledger = get_suppression_ledger(results)
+        if suppression_ledger is not None:
+            # The embedded report JSON carries the same audit trail as the
+            # standalone JSON report; nothing is suppressed silently.
+            report_data["suppressions"] = suppression_ledger
         # CI-native pages link Download JSON to the retained canonical file, so
         # nothing on them reads an embedded copy. Only standalone reports embed it.
         report_json = None
@@ -3142,6 +3151,7 @@ class HTMLReporter(ReporterBase):
             finding_anchors=tier1_finding_anchors,
             check_anchors=tier1_check_anchors,
             fix_first=tier1_fix_first,
+            suppressions=suppression_ledger,
         )
 
     def get_file_extension(self) -> str:

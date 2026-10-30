@@ -45,6 +45,7 @@ from skillevaluator.reporting.harbor_viewer import (
     normalize_harbor_viewer_for_display,
     safe_url,
 )
+from skillevaluator.suppressions import get_suppression_ledger, suppressed_finding_records
 from skillevaluator.utils.rich_markup import escape_markup
 
 if TYPE_CHECKING:
@@ -168,6 +169,8 @@ class CLIReporter(ReporterBase):
             )
             for result in non_blocking:
                 self.render_result(result, console)
+
+        self._print_suppressions(results, console)
 
         # Print overall status
         advisory_skips = [result for result in results if self._is_advisory_agent_eval_skip(result)]
@@ -551,6 +554,54 @@ class CLIReporter(ReporterBase):
             console.print(f"     [dim]{label}:[/dim]     {escape_markup(finding.suggestion)}")
         console.print()
 
+    @staticmethod
+    def _print_suppressions(results: list[ValidationResult], console: Console) -> None:
+        """Print suppressed findings and exemption warnings without hiding them.
+
+        Suppressed findings are out of the gate but stay reviewable: each line
+        names the finding, the rule that exempted it, the scoped path, and why.
+        Expired/unmatched/blocked rules render as explicit warnings.
+        """
+        ledger = get_suppression_ledger(results)
+        if ledger is None:
+            return
+
+        records = [record for result in results for record in suppressed_finding_records(result)]
+        if records:
+            console.print(
+                Panel.fit(
+                    f"[bold]Suppressed Findings[/bold] [dim]({len(records)} removed from the gate)[/dim]",
+                    style="cyan",
+                    border_style="cyan",
+                )
+            )
+            for record in records[:20]:
+                location = record.get("matched_path") or record.get("file_path") or ""
+                if record.get("line_number"):
+                    location = f"{location}:{record['line_number']}"
+                reason = record.get("reason") or "no reason recorded"
+                console.print(
+                    f"  [cyan]\u25aa[/cyan] [dim]{escape_markup(str(record.get('check')))}[/dim] "
+                    f"{escape_markup(str(location))}"
+                )
+                console.print(
+                    f"      [dim]suppressed by[/dim] {escape_markup(str(record.get('rule_id')))} "
+                    f"[dim]({escape_markup(str(record.get('matched_glob')))})[/dim] "
+                    f"\u2014 {escape_markup(str(reason))}"
+                    + (f" [dim]expires {record['expires']}[/dim]" if record.get("expires") else "")
+                )
+            remaining = len(records) - 20
+            if remaining > 0:
+                console.print(f"  [dim]\u2026 and {remaining} more suppressed finding(s)[/dim]")
+            console.print()
+
+        warnings = [message for message in ledger.get("warnings", []) if isinstance(message, str)]
+        if warnings:
+            console.print("[bold yellow]Exemption warnings:[/bold yellow]")
+            for message in warnings:
+                console.print(f"  [yellow]\u26a0[/yellow] {escape_markup(message)}")
+            console.print()
+
     def _print_summary_table(self, results: list[ValidationResult], console: Console) -> None:
         """Print summary table for all validators."""
         table = Table(
@@ -606,6 +657,10 @@ class CLIReporter(ReporterBase):
                 if s.warnings > 0:
                     parts.append(f"{s.warnings} warnings")
                 details = ", ".join(parts) if parts else "Failed"
+
+            suppressed_count = len(suppressed_finding_records(result))
+            if suppressed_count:
+                details = f"{details}, [cyan]{suppressed_count} suppressed[/cyan]"
 
             table.add_row(escape_markup(str(result.validator_name)), status, details)
 

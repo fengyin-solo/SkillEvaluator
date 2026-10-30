@@ -6,6 +6,18 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Added
 
+- `validate --ignore-file FILE` loads a reviewable exemptions document, and
+  `skillevaluator-ignore.yaml` in the target skill root is discovered
+  automatically (disable with `--strict`). Each rule names a normalized
+  `CATEGORY.check_name` plus at least one scoped, skill-relative path glob
+  (blanket globs, absolute/traversal paths, and invalid globs are rejected),
+  with optional `reason` and `expires`. Matched, unexpired findings leave the
+  gate but remain visible with their rule id, glob, reason, expiry, and source
+  file in CLI, JSON, HTML, and Markdown reports; SARIF emits them as natively
+  suppressed results plus a run-level count. Expired and never-matched rules
+  produce visible warnings, and incomplete-scan findings, missing required
+  evidence, and `SECRET.*` findings cannot be exempted; a document that fails
+  to parse fails the run.
 - `tier3 evaluate` now leads with a case-first summary: a verdict line and one
   row per `evals.json` case. With one agent, each row shows, for with and
   without the skill, the pass count, per-attempt marks (`✓` pass, `✗` fail,

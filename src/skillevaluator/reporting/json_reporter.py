@@ -31,6 +31,7 @@ from skillevaluator.reporting.base import (
     select_agent_eval_payload,
 )
 from skillevaluator.source_identity import recorded_evaluated_source
+from skillevaluator.suppressions import get_suppression_ledger, suppressed_finding_records
 
 if TYPE_CHECKING:
     from skillevaluator.models import ValidationResult
@@ -209,6 +210,13 @@ class JSONReporter(ReporterBase):
         # report is written, so this fails closed only on programmatic misuse.
         data["evaluated_source"] = recorded_evaluated_source(r.metadata for r in results)
 
+        suppression_ledger = get_suppression_ledger(results)
+        if suppression_ledger is not None:
+            # Suppressed findings are removed from the gate but must never
+            # disappear: publish the full rule ledger (which rule matched
+            # which finding, why, and every expired/unmatched warning).
+            data["suppressions"] = suppression_ledger
+
         gating_by_tier: dict[str, dict[str, Any]] = {}
         for result in results:
             gating = result.metadata.get("gating")
@@ -306,6 +314,10 @@ class JSONReporter(ReporterBase):
                 "messages": result.messages,
             },
         }
+
+        suppressed = suppressed_finding_records(result)
+        if suppressed:
+            data["suppressed_findings"] = suppressed
 
         skillspector_version = result.metadata.get("skillspector_version")
         if isinstance(skillspector_version, str):

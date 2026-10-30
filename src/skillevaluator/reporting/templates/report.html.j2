@@ -1559,6 +1559,41 @@
                 </div>
                 {% endif %}
             </section>
+            {% if suppressions %}
+            {# ==================== REVIEWABLE EXEMPTIONS ==================== #}
+            <section class="fix-first" aria-labelledby="suppression-title" style="margin: 1.25rem 0;">
+                <h3 id="suppression-title">Suppressed findings · {{ suppressions.suppressed_count }} removed from the gate</h3>
+                <p class="fix-meta">Exemption source: <code>{{ suppressions.source }}</code> ({{ 'auto-discovered in the target root' if suppressions.discovered else 'explicit --ignore-file' }}) · {{ suppressions.active_rule_count }} active rule(s){% if suppressions.expired_rule_count %} · {{ suppressions.expired_rule_count }} expired{% endif %}. Suppressed findings stay reviewable here and in the JSON/SARIF exports; they only stop failing the gate.</p>
+                {% if suppressions.suppressed_count %}
+                <table class="top-issues-table" style="margin: 0.75rem 0;">
+                    <thead>
+                        <tr><th>Rule</th><th>Check</th><th>Location</th><th>Reason</th><th>Expires</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for rule in suppressions.rules %}
+                        {% for f in rule.findings %}
+                        <tr>
+                            <td><span class="metadata-tag">{{ rule.id }}</span></td>
+                            <td><code>{{ f.check }}</code></td>
+                            <td><code>{{ f.matched_path }}{% if f.line_number %}:{{ f.line_number }}{% endif %}</code><br><span class="fix-meta">glob <code>{{ f.matched_glob }}</code></span></td>
+                            <td>{{ rule.reason or '—' }}</td>
+                            <td>{{ rule.expires or '—' }}</td>
+                        </tr>
+                        {% endfor %}
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <p class="fix-more">No findings were suppressed by the exemption rules.</p>
+                {% endif %}
+                {% if suppressions.warnings %}
+                <div style="margin-top: 0.5rem;">
+                    <strong>Exemption warnings:</strong>
+                    {% for w in suppressions.warnings %}<p class="fix-more" style="margin: 0.15rem 0;">⚠️ {{ w }}</p>{% endfor %}
+                </div>
+                {% endif %}
+            </section>
+            {% endif %}
             <div id="report-evidence" class="workspace-heading"><h2>Findings &amp; evidence</h2><p>Each check with its findings, evidence and suggested fixes.</p></div>
             {# ==================== FINDING TYPES ==================== #}
             {% if top_issues %}

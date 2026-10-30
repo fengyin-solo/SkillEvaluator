@@ -36,6 +36,7 @@ from skillevaluator.reporting.harbor_viewer import (
     normalize_harbor_viewer_for_display,
     safe_url,
 )
+from skillevaluator.suppressions import get_suppression_ledger
 
 if TYPE_CHECKING:
     from skillevaluator.models import Finding, ValidationResult
@@ -292,7 +293,18 @@ class MarkdownReporter(ReporterBase):
         if severity_breakdown:
             issue_str += f" ({', '.join(severity_breakdown)})"
         lines.append(f"| Total Issues | {issue_str} |")
+
+        suppression_ledger = get_suppression_ledger(results)
+        if suppression_ledger is not None:
+            active_rules = suppression_ledger.get("active_rule_count", 0)
+            lines.append(
+                f"| 🔇 Suppressed Findings | {suppression_ledger.get('suppressed_count', 0)} "
+                f"({active_rules} active rule(s)) |"
+            )
         lines.append("")
+
+        if suppression_ledger is not None:
+            self._render_suppressions(suppression_ledger, lines)
 
         # Quality Score summary (if any QUALITY results present)
         quality_results = [r for r in results if r.metadata.get("quality_scores")]
@@ -548,6 +560,45 @@ class MarkdownReporter(ReporterBase):
                 lines.append("")
 
             lines.append("</details>")
+            lines.append("")
+
+    def _render_suppressions(self, ledger: dict, lines: list[str]) -> None:
+        """Render exempted findings and rule warnings with full provenance."""
+        suppressed_count = ledger.get("suppressed_count", 0)
+        lines.append("## Suppressed Findings")
+        lines.append("")
+        source = _markdown_code_text(ledger.get("source"))
+        discovery = "auto-discovered" if ledger.get("discovered") else "explicit"
+        lines.append(f"*Exemption source: `{source}` ({discovery}).*")
+        lines.append("")
+        if suppressed_count:
+            lines.append("| Rule | Check | Location | Reason | Expires |")
+            lines.append("|------|-------|----------|--------|---------|")
+            for rule in ledger.get("rules", []):
+                for finding in rule.get("findings", []):
+                    location = _markdown_table_cell(
+                        f"{finding.get('matched_path') or finding.get('file_path') or ''}"
+                        f"{':' + str(finding['line_number']) if finding.get('line_number') else ''}"
+                    )
+                    expires = _markdown_inline_text(rule.get("expires") or "—")
+                    lines.append(
+                        f"| `{_markdown_inline_text(rule.get('id'))}` "
+                        f"| `{_markdown_inline_text(rule.get('check'))}` "
+                        f"| <code>{location}</code> "
+                        f"| {_markdown_inline_text(rule.get('reason') or '—')} "
+                        f"| {expires} |"
+                    )
+            lines.append("")
+        else:
+            lines.append("No findings were suppressed by the exemption rules.")
+            lines.append("")
+
+        warnings = [message for message in ledger.get("warnings", []) if isinstance(message, str)]
+        if warnings:
+            lines.append("**Exemption warnings:**")
+            lines.append("")
+            for message in warnings:
+                lines.append(f"- ⚠️ {_markdown_inline_text(message)}")
             lines.append("")
 
     def _render_incomplete(self, result: ValidationResult, lines: list[str]) -> None:

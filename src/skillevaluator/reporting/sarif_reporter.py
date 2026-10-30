@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from skillevaluator import __version__
+from skillevaluator.models.result import Finding
 from skillevaluator.reporting.base import ReporterBase
+from skillevaluator.suppressions import get_suppression_ledger, suppressed_finding_records
 
 if TYPE_CHECKING:
-    from skillevaluator.models import Finding, ValidationResult
+    from skillevaluator.models import ValidationResult
 
 _SARIF_SCHEMA = "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json"
 _TOOL_URI = "https://github.com/NVIDIA/SkillEvaluator"
@@ -183,22 +185,72 @@ def _collect_incomplete_scans(results: list[ValidationResult]) -> list[str]:
     return scans
 
 
-def _build_invocation(results: list[ValidationResult]) -> dict[str, Any]:
+def _build_invocation(results: list[ValidationResult], ledger: dict[str, Any] | None = None) -> dict[str, Any]:
     incomplete_scans = _collect_incomplete_scans(results)
     invocation: dict[str, Any] = {
         "executionSuccessful": not incomplete_scans,
         "endTimeUtc": datetime.now(tz=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
-    if incomplete_scans:
-        invocation["toolExecutionNotifications"] = [
-            {
-                "descriptor": {"id": f"incomplete/{tool}"},
-                "level": "error",
-                "message": {"text": f"{tool} scan did not complete"},
-            }
-            for tool in incomplete_scans
-        ]
+    notifications: list[dict[str, Any]] = [
+        {
+            "descriptor": {"id": f"incomplete/{tool}"},
+            "level": "error",
+            "message": {"text": f"{tool} scan did not complete"},
+        }
+        for tool in incomplete_scans
+    ]
+    # Expired, never-matched, and blocked exemption rules must surface in the
+    # SARIF consumer instead of silently doing nothing.
+    if ledger is not None:
+        for index, message in enumerate(ledger.get("warnings", [])):
+            if isinstance(message, str) and message:
+                notifications.append(
+                    {
+                        "descriptor": {"id": f"suppression-warning/{index}"},
+                        "level": "warning",
+                        "message": {"text": message},
+                    }
+                )
+    if notifications:
+        invocation["toolExecutionNotifications"] = notifications
     return invocation
+
+
+def _suppressed_result_from_record(
+    record: dict[str, Any],
+    workspace_root: Path | None,
+    scan_root: Path | None,
+) -> dict[str, Any]:
+    """Build a SARIF result carrying a native external suppression."""
+    finding = Finding(
+        category=str(record.get("category", "")),
+        severity=str(record.get("severity", "info")),
+        check_name=str(record.get("check_name", "")),
+        message=str(record.get("message", "")),
+        file_path=str(record.get("file_path", "")),
+        line_number=record.get("line_number") if isinstance(record.get("line_number"), int) else None,
+    )
+    validator_name = str(record.get("validator") or "SUPPRESSED")
+    result = _result_from_finding(finding, validator_name, workspace_root, scan_root)
+    reason = record.get("reason") or "no reason recorded"
+    justification = f"Suppressed by {record.get('rule_id')} ({record.get('check')}): {reason}"
+    if record.get("expires"):
+        justification += f" [expires {record['expires']}]"
+    suppression: dict[str, Any] = {
+        "kind": "external",
+        "status": "accepted",
+        "justification": justification,
+        "properties": {
+            "ruleId": record.get("rule_id"),
+            "check": record.get("check"),
+            "matchedGlob": record.get("matched_glob"),
+            "matchedPath": record.get("matched_path"),
+            "ruleSource": record.get("source"),
+        },
+    }
+    result["suppressions"] = [suppression]
+    result["properties"]["suppressed"] = True
+    return result
 
 
 def merge_catalog_sarif_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
@@ -210,6 +262,9 @@ def merge_catalog_sarif_documents(documents: list[dict[str, Any]]) -> dict[str, 
     rules: dict[str, dict[str, Any]] = {}
     results: list[dict[str, Any]] = []
     invocations: list[dict[str, Any]] = []
+    suppression_sources: list[str] = []
+    suppressed_total = 0
+    suppression_rules: dict[str, dict[str, Any]] = {}
     driver: dict[str, Any] = {
         "name": "SkillEvaluator",
         "informationUri": _TOOL_URI,
@@ -228,6 +283,15 @@ def merge_catalog_sarif_documents(documents: list[dict[str, Any]]) -> dict[str, 
                 rules[rule["id"]] = rule
             results.extend(run.get("results", []))
             invocations.extend(run.get("invocations", []))
+            properties = run.get("properties")
+            if isinstance(properties, dict) and properties.get("suppressedFindingCount") is not None:
+                suppressed_total += int(properties.get("suppressedFindingCount") or 0)
+                source = properties.get("suppressionSource")
+                if source and source not in suppression_sources:
+                    suppression_sources.append(source)
+                for rule in properties.get("suppressionRules", []):
+                    if isinstance(rule, dict) and rule.get("id"):
+                        suppression_rules.setdefault(str(rule["id"]), rule)
 
     merged_run: dict[str, Any] = {
         "tool": {
@@ -239,6 +303,12 @@ def merge_catalog_sarif_documents(documents: list[dict[str, Any]]) -> dict[str, 
         "results": results,
         "automationDetails": {"id": "/skillevaluator/catalog"},
     }
+    if suppression_sources or suppressed_total:
+        merged_run["properties"] = {
+            "suppressedFindingCount": suppressed_total,
+            "suppressionSources": suppression_sources,
+            "suppressionRules": list(suppression_rules.values()),
+        }
     if invocations:
         merged_run["invocations"] = invocations
     return {
@@ -288,6 +358,24 @@ class SARIFReporter(ReporterBase):
                 rules[rule["id"]] = rule
                 sarif_results.append(_result_from_finding(finding, validator_name, workspace_root, scan_root))
 
+        # Suppressed findings stay in the SARIF document as natively-suppressed
+        # results: code-scanning UIs show them as acknowledged with the rule
+        # source, while they no longer count against the gate.
+        ledger = get_suppression_ledger(results)
+        suppressed_records = [record for result in results for record in suppressed_finding_records(result)]
+        for record in suppressed_records:
+            finding = Finding(
+                category=str(record.get("category", "")),
+                severity=str(record.get("severity", "info")),
+                check_name=str(record.get("check_name", "")),
+                message=str(record.get("message", "")),
+                file_path=str(record.get("file_path", "")),
+            )
+            validator_name = str(record.get("validator") or "SUPPRESSED")
+            rule = _rule_descriptor(finding, validator_name)
+            rules[rule["id"]] = rule
+            sarif_results.append(_suppressed_result_from_record(record, workspace_root, scan_root))
+
         run: dict[str, Any] = {
             "tool": {
                 "driver": {
@@ -299,8 +387,27 @@ class SARIFReporter(ReporterBase):
             },
             "results": sarif_results,
         }
-        if self.include_timestamp or _collect_incomplete_scans(results):
-            run["invocations"] = [_build_invocation(results)]
+        if ledger is not None:
+            run["properties"] = {
+                "suppressedFindingCount": ledger.get("suppressed_count", len(suppressed_records)),
+                "suppressionRuleCount": ledger.get("rule_count", 0),
+                "suppressionSource": ledger.get("source"),
+                "suppressionAutoDiscovered": bool(ledger.get("discovered")),
+                "suppressionRules": [
+                    {
+                        "id": rule.get("id"),
+                        "check": rule.get("check"),
+                        "paths": rule.get("paths"),
+                        "reason": rule.get("reason"),
+                        "expires": rule.get("expires"),
+                        "status": rule.get("status"),
+                        "matchedCount": rule.get("matched_count"),
+                    }
+                    for rule in ledger.get("rules", [])
+                ],
+            }
+        if self.include_timestamp or _collect_incomplete_scans(results) or ledger is not None:
+            run["invocations"] = [_build_invocation(results, ledger)]
 
         document: dict[str, Any] = {
             "$schema": _SARIF_SCHEMA,

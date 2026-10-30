@@ -218,6 +218,8 @@ Applies to the whole run: target typing, policy profile, reports, tier selection
 | `--profile TEXT` | `$SKILLEVALUATOR_PROFILE`, then `external` | Validation profile: `external` or a custom name. |
 | `--external` | — | Shortcut for `--profile external` (validate for public publication). |
 | `--policy FILE` | none | Custom policy YAML overlaid on top of `--profile`. |
+| `--ignore-file FILE` | auto-discovery | Reviewable exemptions YAML: rules name a normalized `CATEGORY.check_name` plus at least one scoped path glob. Matched unexpired findings leave the gate but stay reported as suppressed with their rule source. Without this flag, `skillevaluator-ignore.yaml` in the target skill root is discovered automatically. See [Reviewable exemptions](tier1-validation.mdx#reviewable-exemptions--ignore-file). |
+| `--strict` | off | Disable automatic discovery of `skillevaluator-ignore.yaml`; exemptions are then loaded only from `--ignore-file`. |
 | `--workers INTEGER RANGE` | `1` | Concurrent skill jobs when validating a folder of skills (`x>=1`). Values above 1 run skills in parallel processes and disable the per-skill pipeline view. |
 
 The [evaluated source provenance](#evaluated-source-provenance) flags also appear in this panel.

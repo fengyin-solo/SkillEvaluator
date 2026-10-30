@@ -3242,6 +3242,24 @@
           "type": "file"
         },
         {
+          "name": "ignore_file",
+          "opts": [
+            "--ignore-file"
+          ],
+          "param_type": "option",
+          "type": "file"
+        },
+        {
+          "default": "False",
+          "is_flag": true,
+          "name": "strict",
+          "opts": [
+            "--strict"
+          ],
+          "param_type": "option",
+          "type": "boolean"
+        },
+        {
           "default": "1",
           "name": "workers",
           "opts": [

@@ -146,6 +146,37 @@ Precedence, highest to lowest: `--policy` overlay, `--profile` flag, `SKILLEVALU
   The active profile name is stamped into the HTML report header and `BENCHMARK.md`, and printed in the run banner under `--verbose`, so reviewers can see which gate was applied.
 </Note>
 
+## Reviewable exemptions (`--ignore-file`)
+
+When a team has already triaged a specific finding and accepts the risk, record it as a **reviewable exemption** instead of filtering report output. Filtering hides every occurrence of a check — including new, unreviewed ones; an exemption rule names one check *and* concrete paths, so unrelated findings still fail the gate.
+
+Pass an exemptions document with `--ignore-file`, or place `skillevaluator-ignore.yaml` in the target skill root for automatic discovery. `--strict` disables auto-discovery, so only an explicit `--ignore-file` is honored.
+
+```yaml title="skillevaluator-ignore.yaml"
+version: 1
+ignores:
+  - id: rename-batch                    # optional; defaults to rule-1, rule-2, ...
+    check: SCHEMA.name_consistency      # required: normalized CATEGORY.check_name
+    paths:                              # required: one or more scoped path globs
+      - SKILL.md
+    reason: "Tracked in SEC-1234; the directory rename lands in the next batch"
+    expires: 2026-12-31                 # optional YYYY-MM-DD; the rule stops suppressing afterward
+```
+
+Rules:
+
+- **`check`** is required and must name a specific, normalized `CATEGORY.check_name` (the same identifiers used by policy `severity_overrides`). Wildcards such as `SCHEMA.*` are rejected.
+- **`paths`** must contain at least one glob relative to the skill root. Globs support `*`/`?` within one path segment and `**` across segments. Blanket patterns (`*`, `**`, `**/*`), absolute paths, drive prefixes, parent traversal (`..`), and invalid globs are rejected.
+- Matching uses skill-relative paths with the host platform's case and separator conventions; findings that cannot be proven to live inside the skill root never match.
+- **`reason`** is optional but strongly recommended for review; **`expires`** is an optional `YYYY-MM-DD` date.
+
+Behavior and safety:
+
+- A matched, unexpired finding is **removed from the gate** but stays visible: CLI, JSON, HTML, and Markdown show a suppressed section with count, rule id, glob, reason, expiry, and source file; SARIF emits the finding as a natively suppressed result (`kind: external`, `status: accepted`) plus a run-level `suppressedFindingCount`.
+- **Expired rules** and **rules that never matched a finding** produce visible warnings in every report.
+- Some things cannot be exempted by design: **incomplete scans / missing required evidence** (findings from a scanner that did not finish), **secret findings** (`SECRET.*`), and any **malformed rule** — an ignore document that fails to parse fails the run instead of granting exemptions.
+- Without `--ignore-file` and without a discovered `skillevaluator-ignore.yaml`, behavior is unchanged.
+
 ## The checks
 
 For `validate`, the default set is `schema`, `version`, `security`, `pii`, `license`, `code-integrity`, `unicode`, `quality`, and `lint`. The `dependency` check requires explicit selection with `--checks` (alias `--tier1-checks`) for `validate`; direct `tier1 PATH` includes it by default. Accepted check-name aliases include `code`/`code-risk` for `code-integrity`, `scripts`/`script-lint` for `lint`, `dependencies`/`deps`/`dependency-audit` for `dependency`, and `licence`/`license-check` for `license`.

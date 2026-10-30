@@ -169,6 +169,7 @@ Examples:
   skillevaluator validate ./my-skill -o reports/            # custom output dir
   skillevaluator validate ./my-skill --no-dedup             # skip Tier 2 dedup
   skillevaluator validate ./my-skill --external             # strict publish profile
+  skillevaluator validate ./my-skill --ignore-file known-issues.yaml  # reviewable exemptions
   skillevaluator validate ./my-skill -c                     # continue on failure (record all issues)
   skillevaluator validate ./my-skill -a codex               # choose the Tier 3 agent
   skillevaluator validate ./my-skill --no-autopilot         # require an existing dataset
@@ -1120,6 +1121,10 @@ def _catalog_child_argv_from_ctx(
         argv.append("--external")
     if params.get("policy_path"):
         argv.extend(["--policy", str(params["policy_path"])])
+    if params.get("ignore_file"):
+        argv.extend(["--ignore-file", str(Path(params["ignore_file"]).resolve())])
+    if params.get("strict"):
+        argv.append("--strict")
     if params.get("profile"):
         argv.extend(["--profile", str(params["profile"])])
     if params.get("agent_eval") is True:
@@ -1675,6 +1680,27 @@ def _print_run_banner(target_path: Path, content_type: str, profile: str | None)
     help="Custom policy YAML overlaid on top of --profile.",
 )
 @click.option(
+    "--ignore-file",
+    "ignore_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    cls=GroupedOption,
+    help_group=_RUN_GROUP,
+    help="Reviewable exemptions YAML. Each rule names CATEGORY.check_name plus at least one "
+    "scoped path glob; matched unexpired findings leave the gate but stay reported as "
+    "suppressed with their rule source. Without this flag, skillevaluator-ignore.yaml in "
+    "the target root is discovered automatically.",
+)
+@click.option(
+    "--strict",
+    "strict",
+    is_flag=True,
+    cls=GroupedOption,
+    help_group=_RUN_GROUP,
+    help="Disable automatic discovery of skillevaluator-ignore.yaml in the target root "
+    "(exemptions are then loaded only from --ignore-file).",
+)
+@click.option(
     "--workers",
     type=click.IntRange(1),
     default=1,
@@ -1906,6 +1932,8 @@ def validate(
     profile: str | None,
     external: bool,
     policy_path: Path | None,
+    ignore_file: Path | None,
+    strict: bool,
     dedup: bool,
     block_on_dedup: bool | None,
     agent_eval: bool | None,
@@ -2048,6 +2076,30 @@ def validate(
             agent_eval=agent_eval,
             include_skills=include_skills,
         )
+
+    # Reviewable finding exemptions. Catalog roots are not skill roots: the
+    # explicit --ignore-file is forwarded to each per-skill child job (which
+    # also performs per-skill auto-discovery), so the parent catalog job does
+    # not load or discover an ignore document itself.
+    from skillevaluator.suppressions import IgnoreFileError, discover_ignore_file, load_ignore_file
+
+    ignore_root = target_path if target_path.is_dir() else target_path.parent
+    ignore_rules = None
+    ignore_source_path: Path | None = None
+    ignore_discovered = False
+    if not is_catalog:
+        if ignore_file is not None:
+            ignore_source_path = ignore_file
+        elif not strict:
+            discovered_ignore = discover_ignore_file(ignore_root)
+            if discovered_ignore is not None:
+                ignore_source_path = discovered_ignore
+                ignore_discovered = True
+        if ignore_source_path is not None:
+            try:
+                ignore_rules = load_ignore_file(ignore_source_path)
+            except IgnoreFileError as exc:
+                raise click.ClickException(str(exc)) from exc
 
     # A directory of skills (no root SKILL.md) is a catalog: run the pipeline
     # once per skill, each as its own job with its own reports.
@@ -2292,6 +2344,42 @@ def validate(
 
     # Reporters and the exit gate consume the same finalized result objects.
     apply_policy(results, policy)
+
+    # Apply reviewable exemptions only after severities are policy-finalized:
+    # matched findings are removed from the gate but retained (with rule
+    # provenance) on the results, so every reporter below shows them instead
+    # of letting them disappear. Expired, unmatched, and non-exemptable rules
+    # come back as visible warnings in the reports (and on stderr in verbose).
+    suppression_ledger = None
+    if ignore_rules is not None and ignore_source_path is not None:
+        from skillevaluator.suppressions import apply_ignore_rules
+
+        suppression_ledger = apply_ignore_rules(
+            results,
+            ignore_rules,
+            source=ignore_source_path,
+            discovered=ignore_discovered,
+            skill_root=ignore_root,
+        )
+        if not quiet:
+            for message in suppression_ledger["warnings"]:
+                click.echo(f"Warning: {message}", err=True)
+        # Refresh the compact view so its Tier 1/Tier 2 blocks agree with the
+        # post-exemption gate the verdict panel reports.
+        if suppression_ledger["suppressed_count"]:
+            post_tier1_ok, post_tier1_rows = summarize_tier1(tier1_gate_results, lineup=check_lineup)
+            post_tier1_rows.append(
+                detail_row(
+                    "suppressed",
+                    f"{suppression_ledger['suppressed_count']} finding(s) exempted by ignore rules",
+                )
+            )
+            view.tier_done(0, failed=not post_tier1_ok, rows=post_tier1_rows)
+            if tier2_index is not None and tier2_gate_results:
+                tier2_ran, tier2_ok, tier2_rows, _tier2_skip = summarize_tier2(tier2_gate_results)
+                if tier2_ran:
+                    view.tier_done(tier2_index, failed=not tier2_ok, rows=tier2_rows)
+
     _finalize_evaluated_source(results, evaluated_source)
 
     content_label = {
