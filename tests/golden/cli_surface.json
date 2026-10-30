@@ -1,5 +1,50 @@
 {
   "commands": {
+    "checks": {
+      "params": [
+        {
+          "name": "target_path",
+          "opts": [
+            "target_path"
+          ],
+          "param_type": "argument",
+          "type": "path"
+        },
+        {
+          "choices": [
+            "skill",
+            "rules",
+            "workflows",
+            "plugin"
+          ],
+          "name": "content_type",
+          "opts": [
+            "--type"
+          ],
+          "param_type": "option"
+        },
+        {
+          "default": "False",
+          "is_flag": true,
+          "name": "as_json",
+          "opts": [
+            "--json"
+          ],
+          "param_type": "option",
+          "type": "boolean"
+        },
+        {
+          "default": "False",
+          "is_flag": true,
+          "name": "only_applicable",
+          "opts": [
+            "--only-applicable"
+          ],
+          "param_type": "option",
+          "type": "boolean"
+        }
+      ]
+    },
     "compare": {
       "params": [
         {

@@ -18,6 +18,13 @@ from typing import Any
 import click
 
 from skillevaluator import __version__
+
+# Tier 1 (static validation) is the base install surface and is safe to import
+# eagerly. Tier 2 (embeddings/LLM) and Tier 3 (Harbor and its environments)
+# pull heavy, extras-only dependencies, so their command implementations are
+# imported lazily inside the command callbacks. This keeps `import skillevaluator.cli`
+# and the CLI surface available on a base install without those extras.
+from skillevaluator.check_catalog import CONTENT_TYPE_CHOICES
 from skillevaluator.cli_help import GroupedOption, RichGroup
 from skillevaluator.constants import (
     SIMILARITY_DEFAULT_MAX_ENTRIES,
@@ -40,12 +47,6 @@ from skillevaluator.reporting.console_ui import (
     summarize_tier3,
 )
 from skillevaluator.reporting.naming import report_basename
-
-# Tier 1 (static validation) is the base install surface and is safe to import
-# eagerly. Tier 2 (embeddings/LLM) and Tier 3 (Harbor and its environments)
-# pull heavy, extras-only dependencies, so their command implementations are
-# imported lazily inside the command callbacks. This keeps `import skillevaluator.cli`
-# and the CLI surface available on a base install without those extras.
 from skillevaluator.tier1.commands import (
     console,
     emit_reports,
@@ -182,7 +183,7 @@ Examples:
 
 _TOP_LEVEL_COMMAND_HELP_GROUPS = (
     ("Tier workflows", ("tier1", "tier2", "tier3")),
-    ("Core workflows", ("validate", "health-check", "doctor", "models", "dashboard")),
+    ("Core workflows", ("validate", "checks", "health-check", "doctor", "models", "dashboard")),
     (
         "Tier 1 · Static and security",
         ("quality-check", "rubric-eval", "security-scan", "pii-scan", "lint-scripts"),
@@ -3142,6 +3143,51 @@ def view(skill_path: Path, results_dir: Path | None) -> None:
         view_results(skill_path, results_dir=results_dir)
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+@cli.command("checks")
+@click.argument(
+    "target_path",
+    required=False,
+    type=click.Path(path_type=Path),
+)
+@click.option(
+    "--type",
+    "content_type",
+    default=None,
+    type=click.Choice(list(CONTENT_TYPE_CHOICES)),
+    help="Filter/check applicability for a forced content type instead of listing every check.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit stable machine-readable JSON.")
+@click.option(
+    "--only-applicable",
+    is_flag=True,
+    help="With --type or a PATH, omit checks that do not apply to the resolved content type.",
+)
+def checks_command(
+    target_path: Path | None,
+    content_type: str | None,
+    as_json: bool,
+    only_applicable: bool,
+) -> None:
+    """List Tier 1 checks, defaults, content types, dependencies, and evidence.
+
+    Read-only and offline: external-tool availability is resolved from PATH
+    (nothing is executed) and optional packages via import lookup (nothing is
+    imported); no scanner runs and no model request is made. With no PATH or
+    --type, every check is listed; pass a PATH to auto-detect the content type
+    or --type to force it.
+    """
+    from skillevaluator.check_catalog import run_checks_command
+
+    raise SystemExit(
+        run_checks_command(
+            target_path=target_path,
+            content_type=content_type,
+            as_json=as_json,
+            only_applicable=only_applicable,
+        )
+    )
 
 
 @cli.command("models")

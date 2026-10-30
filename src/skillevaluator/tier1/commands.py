@@ -11,12 +11,18 @@ from pathlib import Path
 
 from rich.console import Console
 
+from skillevaluator.check_catalog import (
+    CHECK_REGISTRY,
+    DEFAULT_CHECKS,
+    OPTIONAL_CHECKS,
+    RECOGNIZED_CHECKS,
+    check_applies_to,
+    resolve_check_alias,
+    schema_validator_for,
+)
 from skillevaluator.constants import (
-    CONTENT_TYPE_PLUGIN,
-    CONTENT_TYPE_RULES,
     CONTENT_TYPE_SKILL,
     CONTENT_TYPE_UNKNOWN,
-    CONTENT_TYPE_WORKFLOWS,
     SCAN_EXCLUDED_DIRS,
     SCAN_EXCLUDED_FILES,
 )
@@ -40,18 +46,14 @@ from skillevaluator.validators.code_risk import CodeRiskValidator
 from skillevaluator.validators.dependencies import DependencySecurityValidator
 from skillevaluator.validators.hygiene import HygieneValidator
 from skillevaluator.validators.license import LicenseValidator
-from skillevaluator.validators.plugin_schema import PluginSchemaValidator
 from skillevaluator.validators.policy import ValidationPolicy, apply_policy
 from skillevaluator.validators.quality_score import QualityScoreValidator
 from skillevaluator.validators.rubric_eval import RubricEvalValidator
-from skillevaluator.validators.rules_schema import RulesSchemaValidator
-from skillevaluator.validators.schema import SchemaValidator
 from skillevaluator.validators.script_lint import ScriptLintValidator
 from skillevaluator.validators.secrets import SecretsValidator
 from skillevaluator.validators.security import SecurityValidator
 from skillevaluator.validators.unicode_smuggle import UnicodeSmuggleValidator
 from skillevaluator.validators.version import VersionValidator
-from skillevaluator.validators.workflows_schema import WorkflowsSchemaValidator
 
 # emoji=False: ":name:" codes in untrusted text (such as "root:x:0:0:") must print literally.
 console = Console(emoji=False)
@@ -62,24 +64,11 @@ progress_console = Console(stderr=True)
 
 ValidatorRunner = Callable[[Path], ValidationResult]
 
-DEFAULT_CHECKS = (
-    "schema",
-    "version",
-    "security",
-    "pii",
-    "license",
-    "code-integrity",
-    "unicode",
-    "quality",
-    "lint",
-)
-# Opt-in checks: recognized by ``--checks`` but excluded from the default run.
-# The dependency CVE audit is also available through the standalone
-# ``dependency-audit`` command; the version check above runs by default.
-OPTIONAL_CHECKS = ("dependency",)
-# Every canonical check name ``run_validation`` understands after alias
-# resolution (the default run plus the opt-in checks).
-RECOGNIZED_CHECKS = frozenset(DEFAULT_CHECKS) | frozenset(OPTIONAL_CHECKS)
+# ``DEFAULT_CHECKS``, ``OPTIONAL_CHECKS``, and ``RECOGNIZED_CHECKS`` are imported
+# from the authoritative :mod:`skillevaluator.check_catalog` registry so the
+# runtime lineup and the ``checks`` command catalog cannot drift apart. The
+# dependency CVE audit is the sole opt-in check; the version check runs by
+# default.
 REPORTERS = {
     "json": JSONReporter,
     "html": HTMLReporter,
@@ -124,39 +113,21 @@ def _as_result(
 def _enabled_checks(checks: str | None) -> set[str]:
     if not checks:
         return set(DEFAULT_CHECKS)
-    aliases = {
-        "code": "code-integrity",
-        "code-risk": "code-integrity",
-        "scripts": "lint",
-        "script-lint": "lint",
-        "dependencies": "dependency",
-        "deps": "dependency",
-        "dependency-audit": "dependency",
-        "licence": "license",
-        "license-check": "license",
-    }
     enabled = set()
     for raw in checks.split(","):
-        check = raw.strip().lower()
+        check = raw.strip()
         if check:
-            enabled.add(aliases.get(check, check))
+            enabled.add(resolve_check_alias(check))
     return enabled
 
 
 def _schema_validator_for(content_type: str | None, policy: ValidationPolicy | None):
     """Return the schema validator matching the (forced or detected) content type.
 
-    Rules, workflows, and plugins use their dedicated schema validators; skill
-    and unknown content fall back to the skill :class:`SchemaValidator` (the
-    historical default).
+    Delegates to the shared selection in :mod:`skillevaluator.check_catalog` so
+    the runtime and the ``checks`` catalog always pick the same validator.
     """
-    if content_type == CONTENT_TYPE_RULES:
-        return RulesSchemaValidator()
-    if content_type == CONTENT_TYPE_WORKFLOWS:
-        return WorkflowsSchemaValidator()
-    if content_type == CONTENT_TYPE_PLUGIN:
-        return PluginSchemaValidator()
-    return SchemaValidator(policy=policy)
+    return schema_validator_for(content_type, policy=policy)
 
 
 def enabled_check_lineup(checks: str | None) -> list[str]:
@@ -266,25 +237,29 @@ def run_validation(
         v = DependencySecurityValidator()
         return [_run_result("dependency", v.name, v.description, v.validate)]
 
-    # (check name, builder, applies-to-this-content-type). Quality scoring and
-    # script linting are skill-oriented and skipped for rules/workflows. Finding
-    # severities (incl. the LICENSE.* / CVE findings added below) are normalized
-    # centrally by the active policy in emit_reports, so they honor the
-    # selected validation profile.
-    steps = (
-        ("schema", _schema_results, True),
-        ("version", _version_results, skill_like),
-        ("security", _security_results, True),
-        ("pii", _pii_results, True),
-        ("license", _license_results, True),
-        ("code-integrity", _code_integrity_results, True),
-        ("dependency", _dependency_results, True),
-        ("unicode", _unicode_results, True),
-        ("quality", _quality_results, skill_like),
-        ("lint", _lint_results, skill_like),
-    )
+    # Builders keyed by canonical check id. Ordering and content-type
+    # applicability are driven by the authoritative :mod:`skillevaluator.check_catalog`
+    # registry (via CHECK_REGISTRY / check_applies_to), so the runtime pipeline
+    # can never diverge from the ``checks`` catalog. Quality scoring and script
+    # linting are skill-oriented (skill_only) and skipped for rules/workflows.
+    # Finding severities (incl. the LICENSE.* / CVE findings) are normalized
+    # centrally by the active policy in emit_reports.
+    builders = {
+        "schema": _schema_results,
+        "version": _version_results,
+        "security": _security_results,
+        "pii": _pii_results,
+        "license": _license_results,
+        "code-integrity": _code_integrity_results,
+        "dependency": _dependency_results,
+        "unicode": _unicode_results,
+        "quality": _quality_results,
+        "lint": _lint_results,
+    }
     active = [
-        (check_name, builder) for check_name, builder, applicable in steps if check_name in enabled and applicable
+        (spec.id, builders[spec.id])
+        for spec in CHECK_REGISTRY
+        if spec.id in enabled and spec.id in builders and check_applies_to(spec.id, content_type)
     ]
     with continue_on_failure_scope(continue_on_failure):
         for step_number, (check_name, builder) in enumerate(active, 1):
